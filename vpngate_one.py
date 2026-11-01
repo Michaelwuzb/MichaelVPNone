@@ -1,0 +1,4530 @@
+#!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# 衍生自 aimili-vpngate (https://github.com/baoweise-bot/aimili-vpngate)
+# 依据 GPL-3.0 修改与分发；本文件的衍生部分同样以 GPL-3.0 发布。
+# 完整许可见同目录 LICENSE，改造说明见 NOTICE。
+# ---------------------------------------------------------------------------
+"""
+vpngate_one.py - Single-Port VPN Gateway + Node Management UI
+Combines: one OpenVPN tunnel + full node table (IP info, filters, speed test)
+
+单通道版：整台机器只对外提供**一个** SOCKS5/HTTP 代理端口（默认 7928），
+适合端口资源紧张的 NAT 机 —— 不需要一次映射 6 个端口，也不用为多条隧道
+准备多份 tun 设备。节点池、行政区就近降级、假连接守护等逻辑与多通道版一致。
+"""
+from __future__ import annotations
+import base64, csv, io, json, os, random, re, shlex, signal, socket, subprocess, sys
+import threading, time, urllib.request, urllib.parse
+import ipaddress      # Host 头里区分"纯 IP 直连"和"域名访问"
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+import vpn_utils
+import speedtest_utils
+import ui_tls
+import region_geo   # 国家级之下的行政区定位（都道府县 / 省 / 州）+ 就近降级
+
+# === Auth ===
+# 密码以 PBKDF2-SHA256 哈希存储(兼容旧版明文自动升级)；
+# 守护脚本走单独的长效令牌文件，改面板账号密码不会让它失联。
+import hashlib, hmac, secrets
+
+auth_token_store: dict[str, float] = {}
+login_fail_store: dict[str, list[float]] = {}
+GUARD_TOKEN = ""                  # 启动时从 guard_token 文件载入
+SESSION_TTL = 86400               # 会话有效期(秒)
+MAX_LOGIN_FAILS = 5               # 连续失败 N 次后锁定
+LOGIN_FAIL_WINDOW = 300           # 锁定观察窗口(秒)
+
+def _auth_file() -> Path:
+    return DATA_DIR / "ui_auth.json"
+
+def _guard_token_file() -> Path:
+    return DATA_DIR / "guard_token"
+
+def _hash_password(password: str, salt: str | None = None, iterations: int = 200_000) -> str:
+    salt = salt or secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), iterations)
+    return f"pbkdf2_sha256${iterations}${salt}${dk.hex()}"
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iterations, salt, digest = stored.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), int(iterations))
+        return hmac.compare_digest(dk.hex(), digest)
+    except Exception:
+        return False
+
+def load_auth_config() -> dict:
+    cfg = read_json(_auth_file()) or {}
+    if not cfg.get("username"):
+        cfg["username"] = "admin"
+    return cfg
+
+def save_auth_config(username: str, password: str) -> None:
+    path = _auth_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, {"username": username, "password_hash": _hash_password(password),
+                      "updated_at": int(time.time())})
+    try: os.chmod(path, 0o600)
+    except Exception: pass
+
+def verify_credentials(user: str, password: str) -> bool:
+    cfg = load_auth_config()
+    if user != cfg.get("username", "admin"):
+        return False
+    if cfg.get("password_hash"):
+        return _verify_password(password, str(cfg["password_hash"]))
+    # 兼容旧版明文
+    return hmac.compare_digest(password, str(cfg.get("password", "admin")))
+
+def migrate_plaintext_credentials() -> None:
+    """旧版本把密码明文写在 ui_auth.json 里，首次启动时升级为哈希。"""
+    cfg = read_json(_auth_file()) or {}
+    if not cfg:
+        return
+    if cfg.get("password_hash"):
+        if "password" in cfg:
+            cfg.pop("password", None)
+            write_json(_auth_file(), cfg)
+        return
+    save_auth_config(str(cfg.get("username", "admin")), str(cfg.get("password", "admin")))
+    log("[auth] 明文密码已升级为 PBKDF2 哈希存储")
+
+def load_or_create_guard_token() -> str:
+    try:
+        tok = _guard_token_file().read_text(encoding="utf-8").strip()
+        if len(tok) >= 32:
+            return tok
+    except Exception:
+        pass
+    tok = secrets.token_hex(32)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _guard_token_file().write_text(tok, encoding="utf-8")
+        os.chmod(_guard_token_file(), 0o600)
+        log("[auth] 已生成守护令牌 vpngate_data/guard_token")
+    except Exception as e:
+        log(f"[auth] 守护令牌写入失败: {e}")
+    return tok
+
+def check_auth_token(headers) -> bool:
+    cookie = headers.get("Cookie","") or ""
+    for part in cookie.split(";"):
+        part=part.strip()
+        if part.startswith("token="):
+            tok=part[6:]
+            if not tok:
+                continue
+            # 守护脚本的长效令牌: 不随改密失效，便于无人值守重连
+            if GUARD_TOKEN and hmac.compare_digest(tok, GUARD_TOKEN):
+                return True
+            entry=auth_token_store.get(tok)
+            if entry and time.time()-entry<SESSION_TTL:
+                return True
+            elif entry:
+                del auth_token_store[tok]
+    return False
+
+def generate_token() -> str:
+    tok=secrets.token_hex(32)
+    auth_token_store[tok]=time.time()
+    return tok
+
+def invalidate_all_sessions() -> None:
+    """改完账号密码后清掉所有会话, 强制重新登录(守护令牌不受影响)。"""
+    auth_token_store.clear()
+
+def is_login_locked(ip: str) -> int:
+    """返回剩余锁定秒数, 0 表示未锁定。"""
+    now = time.time()
+    fails = [t for t in login_fail_store.get(ip, []) if now - t < LOGIN_FAIL_WINDOW]
+    login_fail_store[ip] = fails
+    if len(fails) >= MAX_LOGIN_FAILS:
+        return int(LOGIN_FAIL_WINDOW - (now - fails[-1])) + 1
+    return 0
+
+def record_login_failure(ip: str) -> None:
+    login_fail_store.setdefault(ip, []).append(time.time())
+
+def clear_login_failures(ip: str) -> None:
+    login_fail_store.pop(ip, None)
+
+def validate_username(name: str) -> str:
+    if not name:
+        return "账号不能为空"
+    if len(name) < 3 or len(name) > 32:
+        return "账号长度需在 3~32 个字符之间"
+    if not re.match(r"^[A-Za-z0-9_.-]+$", name):
+        return "账号只能包含字母、数字、下划线、点、连字符"
+    return ""
+
+def validate_password(pwd: str, username: str) -> str:
+    if len(pwd) < 8:
+        return "密码至少 8 位"
+    if pwd.lower() == username.lower():
+        return "密码不能与账号相同"
+    if len(set(pwd)) == 1:
+        return "密码过于简单（不可全部为同一字符）"
+    weak = ("12345678", "password", "admin123", "qwertyui", "11111111", "adminadmin")
+    if pwd.lower() in weak:
+        return "密码过于常见，请更换"
+    return ""
+
+def is_default_credentials() -> bool:
+    cfg = load_auth_config()
+    return cfg.get("username") == "admin" and verify_credentials("admin", "admin")
+
+LOGIN_HTML_CACHE = ""
+
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    """读整数环境变量，坏值一律回落默认值 —— systemd 里写错一个字符不该让面板起不来。"""
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        val = int(raw) if raw else default
+    except ValueError:
+        return default
+    return val if (minimum is None or val >= minimum) else default
+
+
+# 单通道：整机只跑一条隧道、只对外开一个代理口（默认 7928）。
+# VPNGATE_CHANNELS 只是留了个口子给调试/自测用；正式部署保持 1，
+# install.sh、面板文案、端口说明都是按单通道写的。
+NUM_CHANNELS = _env_int("VPNGATE_CHANNELS", 1, minimum=1)
+PROXY_BASE_PORT = _env_int("VPNGATE_PROXY_PORT", 7928, minimum=1)
+# tun 设备编号起点：NAT 机上 tun0 经常已经被别的隧道占着（机器本身就是别人的出口），
+# 这种情况用 VPNGATE_TUN_BASE=10 把我们的隧道挪到 tun10/tun11，互不打架。
+TUN_BASE = _env_int("VPNGATE_TUN_BASE", 0, minimum=0)
+# 策略路由表号：通道 i 用 POLICY_TABLE_BASE + i。
+# 用 200 段而不是原来的 100 段——100~108 常被各类网络管理工具占用（VPN/防火墙/容器
+# 网络），撞上就会出现"规则被别人的清理脚本删掉"或者"我们的规则覆盖别人的"。
+# 200~252 是内核留给本地自定义用途的区间，系统不会自动占。
+POLICY_TABLE_BASE = _env_int("VPNGATE_POLICY_TABLE_BASE", 200, minimum=1)
+UI_PORT = _env_int("VPNGATE_UI_PORT", 8787, minimum=1)
+UI_HOST = "::"
+LOCAL_PROXY_HOST = "127.0.0.1"
+# 正式代理口的监听地址。**这个默认值和多通道版不同**：
+# NAT 机的端口是商家从公网 DNAT 到你的内网网卡（10.x / 192.168.x）上的，
+# 绑 127.0.0.1 的话，映射进来的流量根本到不了监听套接字 —— 表现就是
+# "面板显示已连接、端口也映射了，客户端连上去一直超时"。
+# 所以默认绑 0.0.0.0；不想让同网段的人都用，就改成内网地址或 127.0.0.1。
+PROXY_LISTEN_HOST = (os.environ.get("VPNGATE_PROXY_LISTEN") or "0.0.0.0").strip() or "0.0.0.0"
+# 节点 IP 类型的合法取值。unknown = 机构名和 PTR 都判不出类型（见 vpn_utils.py），
+# 它只是"没判出来"，不影响节点可用性，也不影响不指定类型时的自动分配。
+IP_TYPE_KEYS = ("residential", "mobile", "hosting", "unknown")
+# 给用户看的名字。日志/提示里别直接甩 'unknown' 这种内部值。
+IP_TYPE_LABELS = {"residential": "住宅", "mobile": "移动", "hosting": "机房", "unknown": "未知"}
+
+
+def ip_type_label(t: str) -> str:
+    return IP_TYPE_LABELS.get(t or "", t or "")
+
+
+def type_key(ip_type: str) -> str:
+    """把面板/配置里的 IP 类型收敛成合法值；认不出来就当"不限"（返回 ""）。
+
+    **指定了就严格**：这是"住宅模式"的全部含义 —— 判断某县有没有货、能不能降级，
+    都只算该类型的节点。机房（hosting）节点在住宅模式下既不能被选中，也不能
+    因为"该县只剩机房"就误判成"该县还有货"。
+    """
+    t = (ip_type or "").strip().lower()
+    return t if t in IP_TYPE_KEYS else ""
+
+
+API_URL = "https://www.vpngate.net/api/iphone/"
+# 多级节点源，按顺序尝试。所有通道共用同一个节点池：只有一个源的话，
+# vpngate.net 被墙或抽风就是整机没节点可用、重启后连缓存都没有。
+API_URLS = [API_URL, "http://www.vpngate.net/api/iphone/"]
+FETCH_INTERVAL = int(os.environ.get("FETCH_INTERVAL", "600"))
+
+# === 稳定性参数 ===
+WATCHDOG_INTERVAL = int(os.environ.get("WATCHDOG_INTERVAL", "15"))  # 通道巡检间隔(秒)
+FAIL_TOLERANCE = int(os.environ.get("FAIL_TOLERANCE", "3"))         # 连续 N 轮探测不通才重连，抵消抖动
+RECONNECT_COOLDOWN = int(os.environ.get("RECONNECT_COOLDOWN", "90")) # 同通道两次重连最小间隔(秒)
+CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "45"))      # 单次建隧道等待上限(秒)
+# 看门狗原本是**固定 90 秒**重连一次。遇到"强制国家/类型下只有一个候选节点、而这个节点
+# 恰好是死的"情况（VPNGate 上美国节点常年只有 1 个 Cloudflare WARP，且 TCP 端口不可达），
+# 就会永远 90 秒一次地重连同一个死节点：日志刷屏、openvpn 反复起停，
+# 面板看起来就像"服务在无限重启"（其实 systemd 一次都没重启过）。
+# 现在改成失败次数越多退避越久，并给"没有可用节点"加告警节流。
+MAX_RECONNECT_BACKOFF = int(os.environ.get("MAX_RECONNECT_BACKOFF", "1800"))  # 重连退避上限(秒)
+NO_NODE_LOG_INTERVAL = int(os.environ.get("NO_NODE_LOG_INTERVAL", "1800"))    # "无可用节点"告警节流(秒)
+# 失败节点"短期跳过"：刚连不上的节点在一小段时间内不再被选中，避免同一轮反复去撞同一个
+# 死节点。**纯内存、不落盘、不随失败次数延长** —— 进程重启即清空，到点自动重新参与选择。
+# （早期版本用的是持久化黑名单 + TTL 翻倍到 12 小时，副作用是名单越积越多，
+#   节点其实早就恢复了，却还因为"仍在拉黑期内"被一直跳过。已按需求废弃该方案。）
+NODE_SKIP_TTL = int(os.environ.get("NODE_SKIP_TTL", "300"))     # 失败节点跳过时长(秒)
+NODE_SKIP_MAX = int(os.environ.get("NODE_SKIP_MAX", "200"))     # 最多记录条数（纯内存，防膨胀）
+
+# 「降级前先重扫当前地区」：准备从东京都退到埼玉之前，先确认东京都是不是**真的**没节点了。
+# 节点池默认 10 分钟才拉一次，这中间新上线的东京都节点如果不重扫就会被漏掉，
+# 结果明明有新 IP 却已经退到别的县了 —— 这正是本组参数要解决的问题。
+#   REGION_RESCAN_COOLDOWN  同一个县两次重扫的最小间隔（防并发重扫刷爆节点源）
+#   REGION_RESCAN_MAX_AGE   节点池比这个秒数新就不重复联网，直接用当前池子算
+#   REGION_RESCAN_WAIT      面板规划时最多等一次正在进行的刷新多久（单通道路径不等）
+REGION_RESCAN_ENABLED = (os.environ.get("VPNGATE_REGION_RESCAN", "1") or "1").strip().lower() \
+    not in ("0", "off", "no", "false")
+REGION_RESCAN_COOLDOWN = float(os.environ.get("VPNGATE_REGION_RESCAN_COOLDOWN", "60") or 60)
+REGION_RESCAN_MAX_AGE = float(os.environ.get("VPNGATE_REGION_RESCAN_MAX_AGE", "20") or 20)
+REGION_RESCAN_WAIT = float(os.environ.get("VPNGATE_REGION_RESCAN_WAIT", "60") or 60)
+
+# 「自动分配出口」默认跳过的国家/地区：VPNGate 上的 CN 节点基本都是境内志愿者家宽，
+# 拿它当境外出口没有意义，而且通常只有 1 个节点、随时掉线。
+# 想连它仍可在面板上手动指定；想改这个行为用 VPNGATE_EXCLUDE_COUNTRIES= 覆盖(逗号分隔，留空=不排除)。
+_EXCL_ENV = os.environ.get("VPNGATE_EXCLUDE_COUNTRIES")
+EXCLUDE_COUNTRIES = ({c.strip().lower() for c in _EXCL_ENV.split(",") if c.strip()}
+                     if _EXCL_ENV is not None else {"china"})
+
+def is_excluded_country(name: str) -> bool:
+    low = (name or "").strip().lower()
+    return bool(low) and any(low == e or low.startswith(e + " ") for e in EXCLUDE_COUNTRIES)
+
+ROOT_DIR = Path("/opt/aimilivpn")
+DATA_DIR = ROOT_DIR / "vpngate_data"
+CONFIG_DIR = DATA_DIR / "configs"
+NODES_FILE = DATA_DIR / "nodes.json"
+SEEN_FILE = DATA_DIR / "nodes_seen.json"      # 节点首现时间记录（判断"新节点"的基准）
+NODES_SNAPSHOT_FILE = DATA_DIR / "nodes_snapshot.json"   # 上次成功拉取的完整节点（含配置，供源不可用时回退）
+AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
+CHANNELS_FILE = DATA_DIR / "channels.json"
+IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
+
+# === 新节点标记 ===
+# 一个节点"首现时间"落在 TTL 内就算新节点。用时间戳而不是"本次刷新新增"来判定，
+# 是因为采集是 600 秒一轮：用一次性标记的话，10 分钟后标记就没了，用户根本来不及看。
+NEW_NODE_TTL = max(0.0, float(os.environ.get("NEW_NODE_TTL_HOURS", "24")) * 3600)
+SEEN_KEEP_DAYS = float(os.environ.get("SEEN_KEEP_DAYS", "30"))   # 首现记录保留天数，防止文件无限长
+
+# === 测速参数 ===
+PING_WORKERS = max(1, int(os.environ.get("PING_WORKERS", "32")))       # 延迟测试并发数
+PING_TIMEOUT = max(1.0, float(os.environ.get("PING_TIMEOUT", "3")))    # 单个节点 TCP 探测超时(秒)
+SPEEDTEST_MAX_NODES = max(1, int(os.environ.get("SPEEDTEST_MAX_NODES", "20")))  # 单次批量真实测速上限
+
+# 测速专用口：端口**紧跟在正式通道之后**（单通道：7928 → 7929），另配一条 tun1。
+# 原来「测带宽」是借一条空闲通道来当探针：通道都连着就直接报"没有空闲通道"，
+# 借到了也是临时占掉某条通道（通常就是 ch0）的 tun 和代理口，测速期间那条通道的
+# 流量会被导到测试节点上。现在给它一个专属的、面板上不显示的端口，两者彻底分开。
+# 这个口只监听回环地址，不需要在 NAT 上映射出去。
+SPEEDTEST_TUN_INDEX = NUM_CHANNELS                                   # 单通道时为 tun1
+SPEEDTEST_PROXY_PORT = _env_int("VPNGATE_SPEEDTEST_PORT",
+                                PROXY_BASE_PORT + NUM_CHANNELS, minimum=1)
+
+DATA_DIR.mkdir(exist_ok=True, parents=True)
+CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+if not AUTH_FILE.exists():
+    AUTH_FILE.write_text("vpn\nvpn\n")
+    AUTH_FILE.chmod(0o600)
+
+# === Channel State ===
+class Channel:
+    def __init__(self, index: int):
+        self.index = index
+        # 日志里用的标签。正式通道是 CH0；测速专用通道会被改成 SPEED，
+        # 免得日志里冒出个 [CH1] 让人以为多了一条通道。
+        self.label = f"CH{index}"
+        self.tun = f"tun{TUN_BASE + index}"
+        self.proxy_port = PROXY_BASE_PORT + index
+        self.force_country = ""
+        # 国家级之下再指定的行政区（日本=都道府县，如 JP-13 / 东京都）。
+        # 空 = 不限定，整个国家随便挑。留着用户填的原始值（键或名字都行），
+        # 每次选节点时再解析，这样面板显示的中文名和内部匹配键不会打架。
+        self.force_region = ""
+        # 通道**实际落地**的县键（如 JP-11）。force_region 是"我要哪个县"，
+        # region_lock 是"因为目标县没节点，我已经退到哪个县了"。一旦降级落地，
+        # 重连就锁在这个县，即使原目标县后来又冒出可用 IP 也不切回去
+        # （需求：不要因为东京都恢复就来回折腾出口 IP）。
+        self.region_lock = ""
+        self.force_ip_type = ""
+        self.enabled = False
+        self.state = "disconnected"
+        self.node_id = ""
+        self.node_name = ""
+        self.node_ip = ""
+        self.node_country = ""
+        self.node_region = ""
+        self.node_owner = ""
+        self.node_location = ""
+        self.node_ip_type = ""
+        self.node_ip_reason = ""
+        self.node_ip_confidence = ""
+        self.node_latency = 0
+        self.process: subprocess.Popen[str] | None = None
+        self.error = ""
+        self.last_heartbeat = 0.0
+        self.last_node_data: dict | None = None  # Save last node for reconnect
+        self.fail_streak = 0            # 连续探测失败轮数
+        self.last_connect_at = 0.0      # 最近一次发起连接的时间(用于重连冷却)
+        self.connect_fails = 0          # 连续建隧道失败次数（用于指数退避）
+        self.no_node_at = 0.0           # 最近一次"没有可用节点"告警时间（日志节流用）
+        # 选节点时立即占位, 这样并发选节点（多通道 / 重连与切节点同时发生）时不会撞同一个出口 IP。
+        # 连接成功后清空(此时 node_ip 已生效), 断开/失败也清空。
+        self.reserved_ip = ""
+        self.ip_reused = False          # 本次出口 IP 是否因池子不够而复用了别的通道的 IP
+        # --- 测速 ---
+        self.speed_testing = False      # 正在测速（前端据此禁用按钮 / 显示"测速中"）
+        self.speed_mbps = 0.0           # 实测出口带宽
+        self.speed_ttfb_ms = 0
+        self.speed_at = 0.0             # 最近一次测速时间戳
+        self.speed_error = ""
+        self.proxy_error = ""           # 本地代理端口没起来时的原因（启动时探测）
+        self.lock = threading.Lock()
+
+    def to_dict(self) -> dict:
+        d = {"index": self.index, "tun": self.tun, "proxy_port": self.proxy_port,
+             "force_country": self.force_country, "force_region": self.force_region,
+             "region_lock": self.region_lock,
+             # 中文名一起给出去：面板首屏不用等 /api/regions 就能显示"东京都/埼玉县"
+             "force_region_name": region_display(self.force_region),
+             "region_lock_name": region_display(self.region_lock),
+             "force_ip_type": self.force_ip_type, "enabled": self.enabled, "state": self.state,
+             "node_id": self.node_id, "node_name": self.node_name, "node_ip": self.node_ip,
+             "node_country": self.node_country, "node_region": self.node_region,
+             "node_owner": self.node_owner,
+             "node_location": self.node_location, "node_ip_type": self.node_ip_type,
+             "node_ip_reason": self.node_ip_reason,
+             "node_ip_confidence": self.node_ip_confidence,
+             "ip_reused": self.ip_reused, "reserved_ip": self.reserved_ip,
+             "connect_fails": self.connect_fails,
+             "node_latency": self.node_latency, "error": self.error,
+             "speed_testing": self.speed_testing, "speed_mbps": self.speed_mbps,
+             "speed_ttfb_ms": self.speed_ttfb_ms, "speed_at": self.speed_at,
+             "speed_error": self.speed_error, "proxy_error": self.proxy_error}
+        return d
+
+channels: list[Channel] = [Channel(i) for i in range(NUM_CHANNELS)]
+# 测速专用通道：**刻意不放进 channels**。放进去就会被面板渲染成第 10 张卡片、
+# 被 save_channels 落盘、被看门狗当成正式通道去巡检重连——都不是我们要的。
+# 它只在「测带宽」任务期间临时连一个节点，测完立刻断开。
+speedtest_ch = Channel(SPEEDTEST_TUN_INDEX)
+speedtest_ch.proxy_port = SPEEDTEST_PROXY_PORT
+speedtest_ch.label = "SPEED"          # 日志里不出现 CH1，免得看着像多了一条通道
+_speedtest_proxy_lock = threading.Lock()
+nodes_cache: list[dict[str, Any]] = []
+nodes_cache_lock = threading.Lock()
+_last_node_ids: set[str] = set()  # Track previous fetch for duplicate detection
+
+# === 新节点追踪（首现时间持久化）===
+_seen_nodes: dict[str, float] = {}   # {节点id: 首次出现时间戳}
+_seen_lock = threading.Lock()
+_new_muted_at = 0.0                  # "清除新标记"的时间点，早于它的首现不再算新
+
+# === 后台任务状态（延迟测试 / 真实测速）===
+PING_TASK: dict[str, Any] = {"running": False, "done": 0, "total": 0, "ok": 0, "fail": 0,
+                             "started": 0.0, "finished": 0.0, "error": "", "scope": ""}
+SPEED_TASK: dict[str, Any] = {"running": False, "done": 0, "total": 0, "current": "",
+                              "current_ip": "", "ok": 0, "fail": 0, "started": 0.0,
+                              "finished": 0.0, "error": "", "stopped": False, "results": {}}
+TASK_LOCK = threading.Lock()
+_speed_task_stop = threading.Event()
+
+
+def log(msg: str):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def escape_html(s: str) -> str:
+    """转义后塞进 HTML 属性/文本。面板里显示的是代理凭据，不能让它破坏标题属性。"""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&#39;"))
+
+def read_json(path: Path) -> Any:
+    try: return json.loads(path.read_text(encoding="utf-8"))
+    except: return {}
+
+def write_json(path: Path, data: Any):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# === 代理口认证 ===
+# 单通道版把代理口绑在 0.0.0.0（NAT 映射需要，见 PROXY_LISTEN_HOST 的注释），
+# 所以默认必须是"带认证"的，否则就是个谁都能用的开放代理。
+# 凭据只存一份（vpngate_data/proxy_auth.json，chmod 600）：install.sh 生成它，
+# proxy_server 和面板都从这里读，避免 systemd Environment 与文件两处各写一份对不上。
+# 想自己指定就用环境变量 LOCAL_PROXY_USER / LOCAL_PROXY_PASS，优先级更高。
+PROXY_AUTH_FILE = DATA_DIR / "proxy_auth.json"
+
+
+def load_proxy_auth() -> tuple[str, str]:
+    """返回 (账号, 密码)。环境变量优先，其次读 proxy_auth.json；都没有就是 ("", "")。"""
+    user = os.environ.get("LOCAL_PROXY_USER")
+    pwd = os.environ.get("LOCAL_PROXY_PASS")
+    if user is not None and pwd is not None:
+        return user, pwd
+    cfg = read_json(PROXY_AUTH_FILE)
+    u, p = cfg.get("username"), cfg.get("password")
+    if isinstance(u, str) and isinstance(p, str) and u and p:
+        return u, p
+    return "", ""
+
+
+def apply_proxy_auth() -> None:
+    """把读到的凭据写回环境变量 —— proxy_server 只认环境变量，这样两边的判断永远一致。"""
+    u, p = load_proxy_auth()
+    if u and p:
+        os.environ["LOCAL_PROXY_USER"] = u
+        os.environ["LOCAL_PROXY_PASS"] = p
+
+
+def proxy_info() -> tuple[str, str]:
+    """面板上显示的一小段连接信息：(短标签, 完整信息/可复制文本)。"""
+    u, p = load_proxy_auth()
+    port = channels[0].proxy_port if channels else PROXY_BASE_PORT
+    short = f"代理端口 {port}" + (" · 需认证" if u else " · 无认证")
+    full = f"SOCKS5/HTTP  {PROXY_LISTEN_HOST}:{port}"
+    if u:
+        full += f"  账号 {u}  密码 {p}"
+    else:
+        full += "  （未设账号密码：任何能连上这个端口的人都能用，建议装上 install.sh 生成的凭据）"
+    return short, full
+
+
+apply_proxy_auth()
+
+def save_channels():
+    data = {}
+    for ch in channels:
+        data[str(ch.index)] = {
+            "force_country": ch.force_country,
+            "force_region": ch.force_region,
+            "region_lock": ch.region_lock,
+            "force_ip_type": ch.force_ip_type,
+            "enabled": ch.enabled,
+        }
+    write_json(CHANNELS_FILE, data)
+
+# === 失败节点"短期跳过"（不是黑名单，不落盘）===
+# 需求：某个国家（比如美国）暂时没有可用节点时，**不要死等、也不要把节点永久拉黑**，
+# 直接跳到别的可用节点就行 —— 黑名单越积越多，节点早就恢复了还是用不上。
+# 早期实现是持久化黑名单（TTL 随失败次数翻倍、上限 12 小时），已按需求废弃。
+# 现在只保留"同一轮别反复去撞同一个刚失败的节点"这一件事：
+#   * 纯内存，进程重启即清空，不写任何文件；
+#   * 固定 NODE_SKIP_TTL（默认 5 分钟），到点自动恢复，不翻倍；
+#   * 指定国家没有可用候选时，正确做法是放宽到全池（见 get_best_node_for_country），
+#     而不是把这个国家永久排除。
+_skip_until: dict[str, float] = {}   # ip -> 跳过到期时间戳
+_skip_lock = threading.Lock()
+
+
+def upstream_alive(timeout: float = 3.0) -> bool:
+    """本机到公网是否还通。
+
+    断网时所有隧道都会连不上，那不是节点头上的问题——这时不该把它们全跳过，
+    否则网络恢复后要等黑名单过期才能重新用上。
+    """
+    for target in (("1.1.1.1", 443), ("8.8.8.8", 53)):
+        s = None
+        try:
+            s = socket.create_connection(target, timeout=timeout)
+            return True
+        except OSError:
+            continue
+        finally:
+            if s is not None:
+                try: s.close()
+                except OSError: pass
+    return False
+
+
+def skip_node(ip: str, reason: str = "") -> None:
+    """把一个刚连不上的节点短期跳过（纯内存，不落盘）。
+
+    只做"短时间内别再选它"这一件事。不写文件、不延长、不累积 —— 到点自动恢复，
+    进程重启也直接清空，所以**不会出现"节点早已恢复却还被挡着"**的情况。
+    """
+    ip = (ip or "").strip()
+    if not ip:
+        return
+    until = time.time() + NODE_SKIP_TTL
+    with _skip_lock:
+        _skip_until[ip] = until
+        if len(_skip_until) > NODE_SKIP_MAX:          # 纯内存也防膨胀：淘汰最早到期的
+            for k in sorted(_skip_until, key=lambda x: _skip_until[x])[
+                     :len(_skip_until) - NODE_SKIP_MAX]:
+                _skip_until.pop(k, None)
+    log(f"[skip] {ip} 暂时不可用（{reason or '连接失败'}），"
+        f"{max(1, NODE_SKIP_TTL // 60)} 分钟内不再优先选用（到期自动恢复）")
+
+
+def is_node_skipped(ip: str) -> bool:
+    """该 IP 是否还在短期跳过期内（顺手清掉已到期的记录）。"""
+    ip = (ip or "").strip()
+    if not ip:
+        return False
+    with _skip_lock:
+        until = _skip_until.get(ip)
+        if until is None:
+            return False
+        if until > time.time():
+            return True
+        _skip_until.pop(ip, None)
+    return False
+
+
+def skip_count() -> int:
+    with _skip_lock:
+        return len(_skip_until)
+
+
+def mark_node_bad(ch: "Channel", reason: str) -> None:
+    """建隧道失败后，决定要不要把该节点短期跳过。
+
+    先确认本机出口本身是通的：断网时所有通道会一起失败，那是本机的问题，
+    把节点全跳过只会让网络恢复后还要空等一轮跳过过期。
+    """
+    if upstream_alive():
+        skip_node(ch.node_ip, reason)
+    else:
+        log(f"[{ch.label}] 本机出口网络不通，暂不把 {ch.node_ip or '当前节点'} 记为坏节点")
+
+# === 新节点标记 ===
+def load_seen_nodes() -> None:
+    """从磁盘恢复节点首现记录。
+
+    没有这一步，服务一重启基准就归零，整个池子会被当成"全新"刷屏一遍 ——
+    这是做"新节点标记"最容易踩的坑。
+    """
+    global _seen_nodes, _new_muted_at
+    raw = read_json(SEEN_FILE)
+    data: dict[str, float] = {}
+    muted = 0.0
+    if isinstance(raw, dict):
+        if isinstance(raw.get("nodes"), dict):      # 当前格式
+            src = raw["nodes"]
+            try: muted = float(raw.get("muted_at") or 0.0)
+            except (TypeError, ValueError): muted = 0.0
+        else:                                       # 兼容最朴素的 {id: ts} 格式
+            src = raw
+        for k, v in src.items():
+            try: data[str(k)] = float(v)
+            except (TypeError, ValueError): continue
+    with _seen_lock:
+        _seen_nodes = data
+        _new_muted_at = muted
+    log(f"[seen] 载入 {len(data)} 条节点首现记录")
+
+def save_seen_nodes() -> None:
+    with _seen_lock:
+        payload = {"muted_at": _new_muted_at, "nodes": dict(_seen_nodes)}
+    try: write_json(SEEN_FILE, payload)
+    except Exception as e: log(f"[seen] 保存失败: {e}")
+
+def _prune_seen(current_ids: set[str]) -> None:
+    """清理早就消失的节点记录，只保留"当前池里有"和"首现还在保留期内"的。"""
+    cutoff = time.time() - SEEN_KEEP_DAYS * 86400
+    with _seen_lock:
+        dead = [k for k, v in _seen_nodes.items() if k not in current_ids and v < cutoff]
+        for k in dead: _seen_nodes.pop(k, None)
+
+def annotate_new_nodes(nodes: list[dict[str, Any]]) -> dict[str, Any]:
+    """给节点打 first_seen 标记，并统计本次新增。
+
+    返回 {"new": 本次新出现的条数, "new_ids": [...], "baseline": 是否刚建立基准}。
+
+    建基准那一次会把"新"的水位线一起抬到当前时刻：我们并不知道这批节点是什么时候上线的，
+    不抬水位线的话，首现时间全等于"刚刚"，整个池子会被当成新节点刷满一屏。
+    """
+    global _new_muted_at
+    now = time.time()
+    res: dict[str, Any] = {"new": 0, "new_ids": [], "baseline": False}
+    with _seen_lock:
+        baseline = not _seen_nodes
+        res["baseline"] = baseline
+        if baseline:
+            _new_muted_at = now
+        for n in nodes:
+            nid = str(n.get("id") or "")
+            if not nid:
+                n["is_new"] = False; n["first_seen"] = 0.0
+                continue
+            fs = _seen_nodes.get(nid)
+            if fs is None:
+                _seen_nodes[nid] = now
+                n["first_seen"] = now
+                n["is_new"] = not baseline
+                if not baseline:
+                    res["new"] += 1
+                    res["new_ids"].append(nid)
+            else:
+                n["first_seen"] = fs
+                n["is_new"] = False
+    return res
+
+def is_new_by_ttl(first_seen: float, now: float | None = None) -> bool:
+    """"新"徽标的判定：首现时间落在 TTL 之内，且没被"清除新标记"清掉。"""
+    if not first_seen or NEW_NODE_TTL <= 0:
+        return False
+    if first_seen <= _new_muted_at:
+        return False
+    return (now or time.time()) - first_seen <= NEW_NODE_TTL
+
+def clear_new_marks() -> int:
+    """把当前所有节点的"新"标记一次性清掉（保留首现历史，只记一个水位线）。"""
+    global _new_muted_at
+    with _seen_lock:
+        _new_muted_at = time.time()
+    save_seen_nodes()
+    log("[seen] 已清除全部新节点标记")
+    return 0
+
+def persist_nodes() -> None:
+    """把内存里的节点池落盘（去掉体积很大的 config_text）。"""
+    with nodes_cache_lock:
+        stripped = [{k: v for k, v in n.items() if k != "config_text"} for n in nodes_cache]
+    try: write_json(NODES_FILE, stripped)
+    except Exception as e: log(f"[nodes] 落盘失败: {e}")
+
+def merge_node_metrics(nodes: list[dict[str, Any]]) -> None:
+    """把上一轮已经测出来的延迟/带宽按节点 id 合并到新池子里。
+
+    采集是整池替换的，不做合并的话每轮刷新都会把测速结果抹掉 ——
+    用户刚测完一轮，10 分钟后就一片空白。
+    """
+    with nodes_cache_lock:
+        old = {n.get("id"): n for n in nodes_cache if n.get("id")}
+    for n in nodes:
+        o = old.get(str(n.get("id") or ""))
+        if not o: continue
+        for k in ("tcp_latency", "test_out_mbps", "test_out_at", "test_out_error"):
+            if o.get(k) not in (None, ""):
+                n[k] = o[k]
+
+def node_test_result(nid: str) -> dict[str, Any]:
+    with nodes_cache_lock:
+        for n in nodes_cache:
+            if str(n.get("id") or "") == nid:
+                return {"tcp_latency": n.get("tcp_latency", 0) or 0,
+                        "mbps": n.get("test_out_mbps", 0.0) or 0.0,
+                        "at": n.get("test_out_at", 0.0) or 0.0,
+                        "error": n.get("test_out_error", "") or ""}
+    return {}
+
+# === 延迟测试（TCP 握手 RTT，纯探测零流量）===
+def start_ping_task(ids: list[str] | None = None) -> dict[str, Any]:
+    with TASK_LOCK:
+        if PING_TASK["running"]:
+            return {"ok": False, "error": "已有延迟测试在进行中"}
+        with nodes_cache_lock:
+            targets = [(str(n.get("id") or ""), str(n.get("ip") or ""), str(n.get("port") or "443"))
+                       for n in nodes_cache if n.get("ip")]
+        if ids:
+            want = {str(i) for i in ids if i}
+            targets = [t for t in targets if t[0] in want]
+            scope = "selected"
+        else:
+            scope = "all"
+        if not targets:
+            return {"ok": False, "error": "没有可测试的节点"}
+        PING_TASK.update({"running": True, "done": 0, "total": len(targets), "ok": 0,
+                          "fail": 0, "started": time.time(), "finished": 0.0,
+                          "error": "", "scope": scope})
+    threading.Thread(target=_ping_worker, args=(targets,), daemon=True).start()
+    log(f"[ping] 开始延迟测试 {len(targets)} 个节点")
+    return {"ok": True, "total": len(targets), "scope": scope}
+
+def _ping_worker(targets: list[tuple[str, str, str]]) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    results: dict[str, int] = {}
+
+    def probe(item: tuple[str, str, str]) -> tuple[str, int]:
+        nid, ip, port = item
+        try: p = int(port)
+        except (TypeError, ValueError): p = 443
+        return nid, speedtest_utils.tcp_latency(ip, p, timeout=PING_TIMEOUT)
+
+    try:
+        with ThreadPoolExecutor(max_workers=PING_WORKERS) as pool:
+            for nid, ms in pool.map(probe, targets):
+                results[nid] = ms
+                with TASK_LOCK:
+                    PING_TASK["done"] += 1
+                    if ms > 0: PING_TASK["ok"] += 1
+                    else: PING_TASK["fail"] += 1
+    except Exception as e:
+        with TASK_LOCK: PING_TASK["error"] = f"{type(e).__name__}: {e}"
+        log(f"[ping] 异常: {e}")
+
+    now = time.time()
+    with nodes_cache_lock:
+        for n in nodes_cache:
+            nid = str(n.get("id") or "")
+            if nid in results:
+                n["tcp_latency"] = results[nid]
+                n["tcp_latency_at"] = now
+    persist_nodes()
+    with TASK_LOCK:
+        PING_TASK["running"] = False
+        PING_TASK["finished"] = now
+    log(f"[ping] 完成 {PING_TASK['ok']} 通 / {PING_TASK['fail']} 不通")
+
+# === 真实带宽测速 ===
+def _proxy_credentials() -> tuple[str | None, str | None]:
+    """本机 SOCKS 口的认证信息（跟 proxy_server 读同一组环境变量）。"""
+    return (os.environ.get("LOCAL_PROXY_USER") or os.environ.get("LOCAL_PROXY_USERNAME"),
+            os.environ.get("LOCAL_PROXY_PASS") or os.environ.get("LOCAL_PROXY_PASSWORD"))
+
+def run_channel_speedtest(ch: Channel) -> dict[str, Any]:
+    """经该通道的 SOCKS 口跑一次下载测速。同步，调用方负责放线程里。"""
+    u, p = _proxy_credentials()
+    res = speedtest_utils.speedtest_via_proxy(LOCAL_PROXY_HOST, ch.proxy_port,
+                                              username=u, password=p)
+    with ch.lock:
+        ch.speed_testing = False
+        ch.speed_at = time.time()
+        if res.get("ok"):
+            ch.speed_mbps = float(res.get("mbps") or 0.0)
+            ch.speed_ttfb_ms = int(res.get("ttfb_ms") or 0)
+            ch.speed_error = ""
+            log(f"[speed] {ch.label} {ch.speed_mbps} Mbps (TTFB {ch.speed_ttfb_ms}ms)")
+        else:
+            ch.speed_mbps = 0.0
+            ch.speed_error = str(res.get("error") or "测速失败")[:200]
+            log(f"[speed] {ch.label} 失败: {ch.speed_error}")
+    return res
+
+def start_channel_speedtest(ch: Channel) -> dict[str, Any]:
+    if ch.state != "connected":
+        return {"ok": False, "error": f"{ch.label} 未连接，无法测速"}
+    with ch.lock:
+        if ch.speed_testing:
+            return {"ok": False, "error": f"{ch.label} 正在测速中"}
+        ch.speed_testing = True
+        ch.speed_error = ""
+    threading.Thread(target=run_channel_speedtest, args=(ch,), daemon=True).start()
+    return {"ok": True, "index": ch.index}
+
+def start_all_channel_speedtest() -> dict[str, Any]:
+    """对当前已连接的通道并发测速（每个通道各自走自己的出口）。"""
+    started, skipped = [], []
+    for ch in channels:
+        if ch.state != "connected":
+            skipped.append(ch.index); continue
+        r = start_channel_speedtest(ch)
+        if r.get("ok"): started.append(ch.index)
+        else: skipped.append(ch.index)
+    if not started:
+        return {"ok": False, "error": "没有已连接的通道可测速"}
+    log(f"[speed] 并发测速通道 {started}")
+    return {"ok": True, "started": started, "skipped": skipped}
+
+def _probe_channel() -> Channel:
+    """节点实测用的探针通道：**不是 ch0~ch5 里的任何一条**。
+
+    用的是紧跟正式端口之后的那一个口（默认 7929）和 tun1，面板上不显示、
+    不落盘、不受看门狗管 —— 所以正式通道连着也照样能测速，
+    测速期间也不会把任何一条正式通道的出口切到测试节点上。
+    """
+    return speedtest_ch
+
+def start_node_speed_task(ids: list[str] | None = None, limit: int | None = None) -> dict[str, Any]:
+    """对指定节点（或全部新节点）逐个建隧道实测带宽。
+
+    代价说明：每个节点都要完整建一次隧道再拆掉，约 15~30 秒/个，
+    所以默认只取 limit 个。探针是专用的测速口，不占用 ch0~ch5。
+    """
+    global _speed_task_stop
+    with TASK_LOCK:
+        if SPEED_TASK["running"]:
+            return {"ok": False, "error": "已有节点测速任务在进行中"}
+        with nodes_cache_lock:
+            pool = list(nodes_cache)
+    if ids:
+        want = {str(i) for i in ids if i}
+        targets = [n for n in pool if str(n.get("id") or "") in want]
+    else:
+        now = time.time()
+        targets = [n for n in pool if is_new_by_ttl(n.get("first_seen", 0), now)]
+        if not targets:
+            targets = pool[:SPEEDTEST_MAX_NODES]
+    cap = max(1, min(int(limit or SPEEDTEST_MAX_NODES), SPEEDTEST_MAX_NODES))
+    targets = [n for n in targets if n.get("config_text")][:cap]
+    if not targets:
+        return {"ok": False, "error": "没有可测速的节点（节点池为空或未选中）"}
+    prox_err = ensure_speedtest_proxy()
+    if prox_err:
+        return {"ok": False, "error": f"{prox_err}（测速专用口，ch0~ch5 的代理不受影响）"}
+    _speed_task_stop = threading.Event()
+    with TASK_LOCK:
+        SPEED_TASK.update({"running": True, "done": 0, "total": len(targets), "current": "",
+                           "current_ip": "", "ok": 0, "fail": 0, "started": time.time(),
+                           "finished": 0.0, "error": "", "stopped": False, "results": {}})
+    threading.Thread(target=_node_speed_worker, args=(targets,), daemon=True).start()
+    log(f"[speed] 开始节点实测 speedtest，共 {len(targets)} 个")
+    return {"ok": True, "total": len(targets)}
+
+def stop_node_speed_task() -> dict[str, Any]:
+    if not SPEED_TASK["running"]:
+        return {"ok": False, "error": "没有正在进行的测速任务"}
+    _speed_task_stop.set()
+    log("[speed] 收到停止请求，当前节点测完就收工")
+    return {"ok": True}
+
+def _node_speed_worker(targets: list[dict[str, Any]]) -> None:
+    for node in targets:
+        if _speed_task_stop.is_set():
+            with TASK_LOCK: SPEED_TASK["stopped"] = True
+            break
+        nid = str(node.get("id") or "")
+        nicename = f"{node.get('ip','')}:{node.get('port','')}"
+        with TASK_LOCK:
+            SPEED_TASK["current"] = nid
+            SPEED_TASK["current_ip"] = nicename
+        ch = _probe_channel()
+        ok = False
+        try:
+            with ch.lock:
+                ch.speed_testing = True
+            ok = connect_channel(ch, node)
+            if ok:
+                res = run_channel_speedtest(ch)
+                if res.get("ok"):
+                    mbps = float(res.get("mbps") or 0.0)
+                    with nodes_cache_lock:
+                        for n in nodes_cache:
+                            if str(n.get("id") or "") == nid:
+                                n["test_out_mbps"] = mbps
+                                n["test_out_at"] = time.time()
+                                n["test_out_error"] = ""
+                                break
+                    with TASK_LOCK:
+                        SPEED_TASK["ok"] += 1
+                        SPEED_TASK["results"][nid] = {"ok": True, "mbps": mbps,
+                                                      "ip": node.get("ip", "")}
+                else:
+                    err = str(res.get("error") or "测速失败")[:200]
+                    with nodes_cache_lock:
+                        for n in nodes_cache:
+                            if str(n.get("id") or "") == nid:
+                                n["test_out_error"] = err
+                                n["test_out_at"] = time.time()
+                                break
+                    with TASK_LOCK:
+                        SPEED_TASK["fail"] += 1
+                        SPEED_TASK["results"][nid] = {"ok": False, "error": err,
+                                                      "ip": node.get("ip", "")}
+            else:
+                with TASK_LOCK:
+                    SPEED_TASK["fail"] += 1
+                    SPEED_TASK["results"][nid] = {"ok": False, "ip": node.get("ip", ""),
+                                                  "error": ch.error or "建隧道失败"}
+        except Exception as e:
+            with TASK_LOCK:
+                SPEED_TASK["fail"] += 1
+                SPEED_TASK["results"][nid] = {"ok": False, "ip": node.get("ip", ""),
+                                              "error": f"{type(e).__name__}: {e}"}
+        finally:
+            with ch.lock:
+                ch.speed_testing = False
+            try: disconnect_channel(ch)
+            except Exception: pass
+            with TASK_LOCK: SPEED_TASK["done"] += 1
+            persist_nodes()
+
+    with TASK_LOCK:
+        SPEED_TASK["running"] = False
+        SPEED_TASK["finished"] = time.time()
+        SPEED_TASK["current"] = ""
+        SPEED_TASK["current_ip"] = ""
+    log(f"[speed] 结束：成功 {SPEED_TASK['ok']} / 失败 {SPEED_TASK['fail']}")
+
+def stop_process(proc: subprocess.Popen[str] | None):
+    if proc is None: return
+    try: proc.terminate(); proc.wait(timeout=3)
+    except:
+        try: proc.kill(); proc.wait(timeout=2)
+        except: pass
+
+def _our_config_marker() -> str:
+    """识别"本程序启动的 openvpn"的关键字：我们自己的配置目录绝对路径。
+
+    每个通道的配置都落在 CONFIG_DIR/chN.ovpn，openvpn 命令行里必然出现这个路径，
+    所以拿它做匹配只可能命中自己启动的进程。
+    """
+    return str(CONFIG_DIR)
+
+def cleanup_stale_openvpn() -> list[int]:
+    """清理上次运行残留的、**属于本程序**的 openvpn 进程。
+
+    原来的实现是一句裸的 `pkill -f openvpn`，会无条件杀掉系统上所有 openvpn。
+    这台 VPS 上如果还跑着别的 openvpn（另一个出口、或在手工调试的隧道），
+    会被一起干掉，而且不留任何记录——重启服务后才发现别的隧道没了。
+    这里改成扫描 /proc，只认命令行里出现我们自己配置目录的那些进程。
+    """
+    marker = _our_config_marker()
+    me = os.getpid()
+    victims: list[int] = []
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return victims          # 非 Linux 环境直接跳过
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == me or pid == os.getppid():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue            # 进程刚好退出，或没权限读，跳过
+        if not raw:
+            continue
+        cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+        if "openvpn" not in cmdline or marker not in cmdline:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            victims.append(pid)
+        except OSError:
+            pass
+    if not victims:
+        return victims
+    # 给它们一点时间优雅退出，赖着不走的再强杀，避免下面的建隧道撞 tun 设备
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        alive = [p for p in victims if _pid_alive(p)]
+        if not alive:
+            break
+        time.sleep(0.2)
+    for pid in victims:
+        if _pid_alive(pid):
+            try: os.kill(pid, signal.SIGKILL)
+            except OSError: pass
+    log(f"[init] 清理残留 openvpn 进程 {len(victims)} 个: {victims}")
+    return victims
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+def release_slot(ch: Channel) -> None:
+    """释放出口 IP 预占。
+
+    连接失败/隧道判死/断开时都必须调用，否则这个 IP 会被其它通道**永久避开**，
+    通道的可用池会越用越小。
+    """
+    ch.reserved_ip = ""
+    ch.ip_reused = False
+
+def policy_table(index: int) -> int:
+    """通道 index 对应的策略路由表号。
+
+    200~252 是留给本地自定义用途的区间，不像 100 段那样常被各种网络管理工具占用。
+    """
+    return POLICY_TABLE_BASE + index
+
+def _run_ip(args: list[str]) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(["ip", *args], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None             # 没有 ip 命令（非 Linux）或超时
+
+def cleanup_policy_routing(table: int):
+    """把该策略表删干净。
+
+    `ip rule del table N` 每次只删**一条**匹配项，多条时会静默留下残余，
+    所以必须循环删到删不动为止。原来只调一次，规则残留时会带着旧 tun 设备名
+    留在系统里，继续劫持别的东西的路由决策。
+    """
+    for _ in range(64):        # 上限兜底，永不空转
+        r = _run_ip(["rule", "del", "table", str(table)])
+        if r is None or r.returncode != 0:
+            break
+    _run_ip(["route", "flush", "table", str(table)])
+
+def setup_policy_routing(tun_dev: str, table: int) -> bool:
+    """建策略路由（默认路由 + oif 规则）。返回是否真的建成功。"""
+    cleanup_policy_routing(table)
+    try:
+        subprocess.run(["ip","route","add","default","dev",tun_dev,"table",str(table)], check=True, timeout=2)
+        subprocess.run(["ip","rule","add","oif",tun_dev,"table",str(table)], check=True, timeout=2)
+        for p in ["all","default",tun_dev]:
+            try: subprocess.run(["sysctl","-w",f"net.ipv4.conf.{p}.rp_filter=2"], capture_output=True, timeout=2)
+            except: pass
+        log(f"[route {tun_dev}] table {table} OK")
+        return True
+    except Exception as e:
+        log(f"[route {tun_dev}] Failed: {e}")
+        return False
+
+def policy_routing_ok(tun_dev: str, table: int) -> bool:
+    """回读内核，确认 oif 规则和默认路由都真的落地了。
+
+    不能只看 `ip rule add` 没报错就算完——顺序错位时会出现"面板显示已连接、
+    但流量还是从物理网卡直接出去"（出口 IP 与面板不符），这种问题只能靠回读发现。
+    """
+    r = _run_ip(["rule", "show"])
+    if r is None or f"oif {tun_dev}" not in r.stdout or f"lookup {table}" not in r.stdout:
+        return False
+    r2 = _run_ip(["route", "show", "table", str(table)])
+    if r2 is None:
+        return False
+    return "default" in r2.stdout and tun_dev in r2.stdout
+
+def proxy_port_ready(port: int, tries: int = 3, timeout: float = 1.0) -> bool:
+    """本地 SOCKS 代理端口是否真的在监听。
+
+    隧道通了不等于代理可用：代理进程可能因为端口被占早就静默退出了。
+    """
+    for i in range(max(1, tries)):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+                return True
+        except OSError:
+            if i + 1 < tries:
+                time.sleep(0.5)
+    return False
+
+def openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
+    cmd = ["openvpn","--config",config_file,"--dev",tun_dev,"--dev-type","tun",
+           "--pull-filter","ignore","route-ipv6","--pull-filter","ignore","ifconfig-ipv6",
+           "--pull-filter","ignore","inactive",
+           "--route-delay","2","--connect-retry-max","999","--connect-timeout","15",
+           "--keepalive","10","60",
+           "--resolv-retry","infinite",
+           "--auth-user-pass",str(AUTH_FILE),"--auth-nocache","--verb","3",
+           "--data-ciphers","AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
+           "--route-nopull"]
+    # 防中间人：要求节点证书的 keyUsage 带 serverAuth。VPNGate 的 <ca> 是内联的，
+    # 校验走节点自带证书，不需要额外 CA 文件。
+    # 个别节点证书不合规会因此连不上，遇到时设 VPNGATE_STRICT_TLS=0 关掉。
+    if os.environ.get("VPNGATE_STRICT_TLS", "1") != "0":
+        cmd.extend(["--remote-cert-tls", "server"])
+    if Path("/etc/ssl/certs").exists(): cmd.extend(["--capath","/etc/ssl/certs"])
+    return cmd
+
+def connect_channel(ch: Channel, node: dict) -> bool:
+    with ch.lock:
+        stop_process(ch.process); ch.process = None
+        cleanup_policy_routing(policy_table(ch.index))
+        ch.state = "connecting"
+        ch.last_connect_at = time.time()
+        ch.fail_streak = 0
+        ch.node_id = node.get("id","")
+        ch.node_name = node.get("hostname",node.get("ip",""))
+        ch.node_ip = node.get("ip",node.get("remote_host",""))
+        ch.node_country = node.get("country_long",node.get("country",""))
+        ch.node_region = node.get("region","")
+        ch.node_owner = node.get("owner","")
+        ch.node_location = node.get("location","")
+        ch.node_ip_type = node.get("ip_type","")
+        ch.node_ip_reason = node.get("ip_reason","")
+        ch.node_ip_confidence = node.get("ip_confidence","")
+        ch.error = ""
+    config_text = node.get("config_text","")
+    config_path = CONFIG_DIR / f"ch{ch.index}.ovpn"
+    config_path.write_text(config_text)
+    cmd = openvpn_cmd(str(config_path), ch.tun)
+    log(f"[{ch.label}] Starting {ch.tun}...")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except Exception as e:
+        ch.state = "error"; ch.error = str(e); ch.last_node_data = None; release_slot(ch); return False
+    ok = False; deadline = time.time() + CONNECT_TIMEOUT; tail = []
+    while time.time() < deadline:
+        try: line = proc.stdout.readline()
+        except: break
+        if not line: break
+        line = line.strip(); tail.append(line); tail = tail[-20:]
+        if "initialization sequence completed" in line.lower(): ok = True; break
+        if "auth_failed" in line.lower() or "authentication failed" in line.lower():
+            ch.state = "error"; ch.error = "AUTH_FAILED"; ch.last_node_data = None
+            release_slot(ch); stop_process(proc); return False
+    if not ok:
+        stop_process(proc); ch.state = "error"; ch.error = tail[-1][:200] if tail else "timeout"
+        release_slot(ch); mark_node_bad(ch, "建隧道超时/失败"); return False
+    # 隧道连通性实测：TCP 优先（ICMP 常被节点丢弃，ping 会误判成"隧道死了"）
+    tunnel_ok = False
+    for _try in range(4):
+        if vpn_utils.probe_tunnel(ch.tun, timeout=3):
+            tunnel_ok = True
+            break
+        time.sleep(1)
+    if not tunnel_ok:
+        log(f"[{ch.label}] Tunnel dead, switching node...")
+        stop_process(proc)
+        ch.state = "error"
+        ch.error = "tunnel unreachable"
+        ch.last_node_data = None
+        release_slot(ch)
+        mark_node_bad(ch, "隧道不通")
+        return False
+
+    # 策略路由必须**先**建好，再对外宣告已连接。
+    # 原实现是先置 state="connected" 再 setup_policy_routing，中间那几十毫秒里
+    # 走代理的流量会因为 oif 规则还没落地而从物理网卡直接出去（出口 IP 与面板不符）。
+    table = policy_table(ch.index)
+    if not setup_policy_routing(ch.tun, table) or not policy_routing_ok(ch.tun, table):
+        log(f"[{ch.label}] 策略路由未生效，放弃本次连接")
+        stop_process(proc)
+        cleanup_policy_routing(table)
+        ch.state = "error"; ch.error = "policy routing not applied"
+        ch.last_node_data = None
+        release_slot(ch)
+        mark_node_bad(ch, "策略路由未生效")
+        return False
+
+    # 代理端口必须真的在听。隧道通了不代表代理可用：端口被占时代理线程早就静默退出了，
+    # 这种情况下面板会显示"已连接"、实际却根本用不了。
+    if not proxy_port_ready(ch.proxy_port):
+        log(f"[{ch.label}] 本地代理端口 {ch.proxy_port} 无响应，放弃本次连接")
+        stop_process(proc)
+        cleanup_policy_routing(table)
+        ch.state = "error"; ch.error = f"proxy port {ch.proxy_port} not listening"
+        ch.last_node_data = None
+        release_slot(ch)
+        mark_node_bad(ch, f"本地代理端口 {ch.proxy_port} 无响应")
+        return False
+
+    landed = ""
+    with ch.lock:
+            ch.process = proc
+            ch.state = "connected"
+            ch.last_heartbeat = time.time()
+            ch.last_node_data = node
+            ch.fail_streak = 0
+            ch.connect_fails = 0     # 连上了，退避计数归零
+            ch.reserved_ip = ""   # 预占转正：node_ip 已生效，无需再占位
+            # 落地的县写进 region_lock：降级之后就不再回切目标县。
+            # 只有"用户明确指定了县"时才锁 —— 不指定县（整个国家随便挑）的通道
+            # 不该被锁在某个县里，否则可用候选会莫名其妙变少。
+            if ch.force_region and node.get("region_key"):
+                landed = node["region_key"].strip().upper()
+                ch.region_lock = landed
+    log(f"[{ch.label}] Connected! {ch.tun} :{ch.proxy_port} {ch.node_ip} (table {table})")
+    if landed:
+        want_key = region_key_of(ch.force_region)
+        if want_key and landed != want_key:
+            pref = region_geo.lookup_prefecture(landed)
+            want = region_geo.lookup_prefecture(want_key)
+            log(f"[{ch.label}] 出口落在 {pref['name'] if pref else landed}"
+                f"（{want['name'] if want else want_key} 当前没有可用节点），已锁定该县："
+                f"后续重连不会再切回 {want['name'] if want else want_key}")
+    return True
+
+def disconnect_channel(ch: Channel):
+    with ch.lock:
+        stop_process(ch.process); ch.process = None
+        cleanup_policy_routing(policy_table(ch.index))
+        ch.state = "disconnected"; ch.node_id = ""; ch.node_name = ""; ch.node_ip = ""
+        ch.node_country = ""; ch.node_region = ""; ch.node_owner = ""; ch.node_location = ""; ch.node_ip_type = ""
+        ch.node_ip_reason = ""; ch.node_ip_confidence = ""
+        ch.node_latency = 0; ch.error = ""; ch.fail_streak = 0; ch.connect_fails = 0
+        release_slot(ch)
+        # Keep config file for watchdog retry
+    log(f"[{ch.label}] Disconnected")
+
+def port_bindable(family: int, addr: tuple) -> str:
+    """端口能不能绑；返回空串=可用，否则返回原因。"""
+    s = None
+    try:
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(addr)
+        return ""
+    except OSError as e:
+        return str(e)
+    finally:
+        if s is not None:
+            try: s.close()
+            except OSError: pass
+
+def preflight_ports() -> dict[str, str]:
+    """启动前先探一遍要用的端口，把冲突提前暴露出来。
+
+    单通道只占 3 个端口：面板 8787 + 代理 7928（监听 PROXY_LISTEN_HOST）
+    + 测速专用口 7929（只监听回环）。
+    任一被占，服务要么起不来要么静默失效，日志里只有子线程的一行 print，排查起来很绕。
+    这里在主线程里一次探清，直接写进启动日志。
+    """
+    problems: dict[str, str] = {}
+    if port_bindable(socket.AF_INET6, ("::", UI_PORT)) and port_bindable(socket.AF_INET, ("0.0.0.0", UI_PORT)):
+        problems["ui"] = f"面板端口 {UI_PORT} 已被占用"
+    for ch in channels:
+        reason = port_bindable(socket.AF_INET, (PROXY_LISTEN_HOST, ch.proxy_port))
+        if reason:
+            problems[f"proxy{ch.index}"] = f"代理端口 {PROXY_LISTEN_HOST}:{ch.proxy_port} 不可用: {reason}"
+    # 测速口单独报：它挂了只影响「测带宽」，正式通道照常工作，不能混在一起吓人
+    reason = port_bindable(socket.AF_INET, (LOCAL_PROXY_HOST, SPEEDTEST_PROXY_PORT))
+    if reason:
+        problems["speedtest"] = (f"测速专用端口 {SPEEDTEST_PROXY_PORT} 不可用: {reason}"
+                                 "（只影响「测带宽」，通道代理不受影响）")
+    return problems
+
+def start_all_proxies() -> dict[int, str]:
+    """启动本地 SOCKS/HTTP 代理，返回 {通道号: 失败原因}，空字典=全部就绪。
+
+    关键改动：监听套接字在**主线程**里按顺序建好，再交给子线程跑 accept 循环。
+    原来是每个通道一个子线程各自 bind，绑定失败只在那个线程里 print 一行就 return，
+    主进程完全不知情 —— 最坏会出现"面板显示已连接、实际端口没在听"，
+    而且从任何界面都看不出来。现在失败会落到 ch.proxy_error，面板直接标红，
+    该通道也不会被判定为已连接。
+    """
+    import proxy_server as proxy
+    failed: dict[int, str] = {}
+    for ch in channels:
+        try:
+            listener = proxy.create_proxy_listener(PROXY_LISTEN_HOST, ch.proxy_port)
+        except Exception as e:
+            msg = f"端口 {PROXY_LISTEN_HOST}:{ch.proxy_port} 绑定失败: {e}"
+            failed[ch.index] = msg
+            ch.proxy_error = msg
+            log(f"[proxy] CH{ch.index} {msg}")
+            continue
+        ch.proxy_error = ""
+        threading.Thread(target=proxy.serve_proxy,
+                         args=(listener, PROXY_LISTEN_HOST, ch.proxy_port, ch.tun),
+                         daemon=True).start()
+        time.sleep(0.05)   # 略微错开，让监听日志按通道顺序打印
+    ok = len(channels) - len(failed)
+    log(f"[init] 代理端口就绪 {ok}/{len(channels)}" + (f"，失败通道: {sorted(failed)}" if failed else ""))
+    return failed
+
+def ensure_speedtest_proxy() -> str:
+    """确保测速专用口的本地代理在监听；返回空串=就绪，否则是失败原因。
+
+    单独拆出来（而不是塞进 start_all_proxies）有两个原因：
+      1. 它不参与"通道就绪"的统计，也不该出现在面板上；
+      2. 启动时这个端口也许被临时占着，测速前再试一次就能起来 ——
+         不该因为一次 bind 失败就让「测带宽」在本进程内永久不可用。
+    和正式通道共用同一套 proxy_server，只是 tun 指向另一条 tun。
+    """
+    import proxy_server as proxy
+    with _speedtest_proxy_lock:
+        if proxy_port_ready(speedtest_ch.proxy_port, tries=1):
+            speedtest_ch.proxy_error = ""
+            return ""
+        try:
+            listener = proxy.create_proxy_listener(LOCAL_PROXY_HOST, speedtest_ch.proxy_port)
+        except Exception as e:
+            msg = f"测速专用端口 {speedtest_ch.proxy_port} 不可用: {e}"
+            speedtest_ch.proxy_error = msg
+            log(f"[proxy] {msg}")
+            return msg
+        speedtest_ch.proxy_error = ""
+        threading.Thread(target=proxy.serve_proxy,
+                         args=(listener, LOCAL_PROXY_HOST, speedtest_ch.proxy_port,
+                               speedtest_ch.tun),
+                         daemon=True).start()
+        log(f"[init] 测速专用口就绪 {LOCAL_PROXY_HOST}:{speedtest_ch.proxy_port} "
+            f"-> {speedtest_ch.tun}（面板不显示，仅「测带宽」使用）")
+        return ""
+
+# === Node Fetching ===
+_last_fetch_source = ""      # 最近一次节点数据的来源（在线地址 / snapshot / 空）
+_snapshot_saved_at = 0.0     # 本地快照的保存时间（内存里记一份，避免状态接口每次都读大文件）
+_nodes_refreshed_at = 0.0    # 节点池最近一次刷新完成的时间（"降级前重扫"据此判断池子够不够新）
+_ui_tls_info: dict | None = None   # 面板证书信息（None = 面板跑在明文 HTTP 上）
+
+
+def ui_tls_status() -> dict[str, Any]:
+    """面板的传输加密状态。证书信息在启动时算好，这里只做格式化，不碰磁盘。"""
+    info = _ui_tls_info
+    days = info.get("days_left") if info else None
+    return {
+        "ui_scheme": "https" if info else "http",
+        "ui_tls_source": (info or {}).get("source", ""),
+        "ui_cert_self_signed": bool((info or {}).get("self_signed")),
+        "ui_cert_days": int(days) if isinstance(days, (int, float)) else None,
+    }
+
+def _parse_vpngate_csv(raw: str) -> list[dict[str, Any]]:
+    """解析 VPNGate 返回的 CSV 文本，按"延迟+速度"粗排。"""
+    lines = raw.strip().split("\n")
+    start = 0
+    if lines and lines[0].startswith("*"): start = 1
+    if len(lines) <= start + 1: return []
+    csv_text = "\n".join(lines[start:])
+    reader = csv.DictReader(io.StringIO(csv_text))
+    nodes = []; seen = set()
+    for row in reader:
+        node_id = (row.get("#HostName") or row.get("HostName") or "").strip()
+        if not node_id or node_id in seen: continue
+        seen.add(node_id)
+        ip = (row.get("IP") or "").strip()
+        port = (row.get("Port") or "443").strip()
+        country = (row.get("CountryLong") or "").strip()
+        config_b64 = (row.get("OpenVPN_ConfigData_Base64") or "").strip()
+        if not config_b64 or not ip: continue
+        try: config_text = base64.b64decode(config_b64).decode("utf-8", errors="replace")
+        except: continue
+        try: ping_val = int((row.get("Ping") or "0").strip())
+        except: ping_val = 0
+        speed = (row.get("Speed") or "0").strip()
+        try: speed_val = int(speed) if speed else 0
+        except: speed_val = 0
+        nodes.append({"id":node_id, "ip":ip, "port":port, "country_long":country, "ping":ping_val,
+                       "speed":speed_val, "config_text":config_text, "hostname":node_id})
+    def score(n):
+        p = max(1, n["ping"]) if n["ping"] > 0 else 999
+        s = n["speed"] if n["speed"] > 0 else 999
+        return p + (s if s < 100 else s * 2)
+    nodes.sort(key=score)
+    return nodes
+
+def save_nodes_snapshot(nodes: list[dict[str, Any]]) -> None:
+    """把这次拉到的节点完整落盘（**含 config_text**）。
+
+    必须留配置文本：回退时拿到的节点没有配置就没法建隧道，等于没回退。
+    所以这里不能复用 nodes.json —— 那份是给面板看的，刻意剥离了配置。
+    """
+    try:
+        write_json(NODES_SNAPSHOT_FILE, {"saved_at": time.time(), "nodes": nodes})
+        global _snapshot_saved_at
+        _snapshot_saved_at = time.time()
+    except Exception as e:
+        log(f"[fetch] 节点快照写入失败: {e}")
+
+def load_nodes_snapshot() -> tuple[list[dict[str, Any]], float]:
+    """读本地节点快照，返回 (可用节点, 保存时间戳)。"""
+    global _snapshot_saved_at
+    data = read_json(NODES_SNAPSHOT_FILE)
+    if not isinstance(data, dict): return [], 0.0
+    raw_nodes = data.get("nodes")
+    if not isinstance(raw_nodes, list): return [], 0.0
+    good = [n for n in raw_nodes if isinstance(n, dict) and n.get("ip") and n.get("config_text")]
+    try: saved_at = float(data.get("saved_at") or 0.0)
+    except (TypeError, ValueError): saved_at = 0.0
+    _snapshot_saved_at = saved_at
+    return good, saved_at
+
+def _fetch_raw(url: str, timeout: int = 30) -> str | None:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log(f"[fetch] {url} 失败: {e}")
+        return None
+
+def fetch_nodes() -> list[dict[str, Any]]:
+    """取节点：官方 HTTPS → 官方 HTTP → 本地快照。
+
+    只保留一个源的时候，源一挂所有通道都没节点可用；快照这一级保证
+    "至少还能用上次那批节点把隧道建起来"，而不是整个面板空掉。
+    """
+    global _last_fetch_source
+    log("[fetch] Fetching nodes...")
+    for url in API_URLS:
+        raw = _fetch_raw(url)
+        if not raw: continue
+        nodes = _parse_vpngate_csv(raw)
+        if not nodes:
+            log(f"[fetch] {url} 返回了 {len(raw)} 字节但解析不出节点，换下一个源")
+            continue
+        nodes = nodes[:300]        # 与节点池上限对齐
+        _last_fetch_source = url
+        save_nodes_snapshot(nodes)
+        log(f"[fetch] {len(nodes)} nodes from {url}")
+        return nodes
+    nodes, saved_at = load_nodes_snapshot()
+    if nodes:
+        age = (time.time() - saved_at) / 3600 if saved_at else -1
+        _last_fetch_source = "snapshot"
+        tip = f"（快照保存于 {age:.1f} 小时前）" if age >= 0 else ""
+        log(f"[fetch] 在线源全部不可用，回退本地快照: {len(nodes)} 个节点{tip}")
+        return nodes
+    _last_fetch_source = ""
+    log("[fetch] 在线源与本地快照都不可用，本次没有节点")
+    return []
+
+def refresh_nodes_once(tag: str = "fetch") -> dict[str, Any]:
+    """拉一次节点：补全 IP 信息 → 合并上轮指标 → 打新节点标记 → 落盘。
+
+    手动拉取、定时采集、启动时的首次拉取全部走这里，三条路径的标记口径必须一致，
+    否则"新节点"会一会儿全亮一会儿全灭。
+    """
+    global nodes_cache, _last_node_ids, _nodes_refreshed_at
+    nodes = fetch_nodes()
+    if not nodes:
+        return {"total": 0, "new": 0, "new_ids": [], "baseline": False,
+                "source": _last_fetch_source}
+    try: vpn_utils.enrich_ip_info(nodes)
+    except Exception as e: log(f"[enrich] Error: {e}")
+    merge_node_metrics(nodes)            # 上轮测出的延迟/带宽不能被整池替换冲掉
+    ann = annotate_new_nodes(nodes)
+    new_ids = {str(n.get("id") or "") for n in nodes if n.get("id")}
+    with nodes_cache_lock: nodes_cache = nodes
+    _last_node_ids = new_ids
+    _nodes_refreshed_at = time.time()
+    _prune_seen(new_ids)
+    persist_nodes()
+    save_seen_nodes()
+    src = "" if _last_fetch_source in ("", "snapshot") else _last_fetch_source
+    log(f"[{tag}] {len(nodes)} nodes (new:{ann['new']})"
+        + ("  ← 本地快照" if _last_fetch_source == "snapshot" else ""))
+    return {"total": len(nodes), "new": ann["new"],
+            "new_ids": ann["new_ids"], "baseline": ann["baseline"],
+            "source": _last_fetch_source, "url": src}
+
+
+def manual_fetch() -> dict:
+    """手动拉取一次节点。返回 {new, dup, total, baseline, new_ids, source}。
+
+    new    = 本次刷新新出现的节点数（对比持久化的首现记录）
+    dup    = 之前就已经见过的节点数
+    source = 数据来源；为 "snapshot" 说明在线源全挂了、用的是本地快照
+    """
+    result: dict[str, Any] = {"new": 0, "dup": 0, "total": 0, "baseline": False,
+                              "new_ids": [], "source": ""}
+    try:
+        r = refresh_nodes_once("manual_fetch")
+        result["total"] = r["total"]
+        result["new"] = r["new"]
+        result["new_ids"] = r.get("new_ids", [])
+        result["baseline"] = bool(r.get("baseline"))
+        result["source"] = r.get("source", "")
+        result["dup"] = max(0, r["total"] - r["new"]) if not r.get("baseline") else 0
+    except Exception as e:
+        log(f"[manual_fetch] Error: {e}")
+    return result
+
+
+def collector_loop():
+    while True:
+        try:
+            refresh_nodes_once("fetch")
+        except Exception as e:
+            log(f"[collector] Error: {e}")
+        try:
+            # 证书快过期时在日志里提醒。结果在 ui_tls 里缓存一小时，
+            # 不会每轮都去解析证书文件。
+            ui_tls.warn_if_expiring(log=log, data_dir=DATA_DIR)
+        except Exception:
+            pass
+        time.sleep(FETCH_INTERVAL)
+
+# === Channel Manager ===
+def occupied_map() -> dict[str, int]:
+    """{出口 IP: 通道号} —— 正在使用或已被预占的出口。
+
+    这里特意把 reserved_ip 和 state=connecting 也算进来：并发选节点时，
+    前一条还在握手(最长 35 秒)，如果只看 connected 就会选到同一个 IP。
+    """
+    out: dict[str, int] = {}
+    for c in channels:
+        ip = c.reserved_ip or c.node_ip
+        if not ip:
+            continue
+        if c.reserved_ip or c.state in ("connected", "connecting"):
+            out[ip] = c.index
+    return out
+
+
+def occupied_ips(exclude_ch: "Channel | None" = None) -> set[str]:
+    """已被其它通道占用/预占的出口 IP 集合。"""
+    return {ip for ip, idx in occupied_map().items()
+            if exclude_ch is None or idx != exclude_ch.index}
+
+
+def occupied_index(exclude_ch: "Channel | None" = None) -> dict[str, int]:
+    """{出口 IP: 通道号}，可排除本通道 —— 用来回答"这个出口被哪条通道占了"。
+
+    注意别拿 `occupied_ips()` 去做这件事：它返回的是 **set**，
+    写 `dup[ip]` 取通道号会直接抛 `'set' object is not subscriptable`。
+    """
+    return {ip: idx for ip, idx in occupied_map().items()
+            if exclude_ch is None or idx != exclude_ch.index}
+
+
+def country_supply(ip_type: str = "") -> dict[str, dict[str, int]]:
+    """各国节点供给统计，用于面板提示"这个国家还剩多少可用 IP"。
+
+    返回 {国家: {total, residential, mobile, hosting, unknown, used}}；used 含预占中的通道。
+    """
+    with nodes_cache_lock:
+        pool = list(nodes_cache)
+    used = set(occupied_map())
+    # unknown 也要能筛：判定不出类型的节点在面板上是"未知"，不是"住宅"
+    key = type_key(ip_type)
+    out: dict[str, dict[str, int]] = {}
+    for n in pool:
+        if key and (n.get("ip_type") or "") != key:
+            continue
+        cname = (n.get("country_long") or "").strip()
+        if not cname:
+            continue
+        e = out.setdefault(cname, {"total": 0, "residential": 0, "mobile": 0,
+                                   "hosting": 0, "unknown": 0, "used": 0})
+        e["total"] += 1
+        t = n.get("ip_type") or ""
+        if t in e:
+            e[t] += 1
+        if n.get("ip") in used:
+            e["used"] += 1
+    return out
+
+
+def _country_match(n: dict, country: str) -> bool:
+    """节点是否属于指定国家。country 为空 = 不限。"""
+    if not country:
+        return True
+    key = country.strip().lower()
+    return (key in (n.get("country_long") or "").lower()
+            or key == (n.get("country") or "").strip().lower()
+            or key == (n.get("country_code") or "").strip().lower())
+
+
+# ============================================================================
+# 行政区级定位（都道府县 / 省 / 州）与"就近降级"
+# ----------------------------------------------------------------------------
+# 需求：要日本东京都的出口；东京都没 IP 就就近选，再没有再往下推。
+# 做法：
+#   1. vpn_utils 把 ip-api 的 region 归一成 region_key（日本为 JP-13 这种 JIS 码）
+#      + region_zone（关东等大区）+ 经纬度；
+#   2. 这里按 region_rank 分层排序 —— 目标县(0) -> 用户指定顺序(1..N，如东京都的
+#      埼玉/神奈川/千叶/山梨) -> 同大区(20, 按距离) -> 全国(21, 按距离) ->
+#      没有坐标(22)；已经因降级落地的通道，原目标县被压到 90 档（不回切）；
+#   3. 排序后的第一条可用节点就是"最近的"；同一档且距离相近的几条里随机，
+#      既保持"就近优先"，又不让出口全挤在同一个节点上。
+# 这样"降级"不是几个 if 堆出来的，而是一条连续的排序链，日志里能说清降到了哪里。
+# ============================================================================
+
+def region_target(country: str, region: str) -> dict | None:
+    """把用户选/输入的行政区解析成目标描述。region 为空返回 None（=不限县）。
+
+    返回 {key, name, zone, lat, lon, preset}。非日本国家没有预置坐标时，
+    用该国同区节点的平均坐标估一个中心点，"就近"才有得算。
+    """
+    region = (region or "").strip()
+    if not region:
+        return None
+    with nodes_cache_lock:
+        pool = list(nodes_cache)
+    in_country = [n for n in pool if _country_match(n, country)]
+    cc = ""
+    for n in in_country:
+        if n.get("country_code"):
+            cc = str(n["country_code"])
+            break
+    tgt = region_geo.resolve_target(region, country, cc)
+    if not tgt:
+        return None
+    if tgt.get("lat") is None:
+        pts = [(n.get("lat"), n.get("lon")) for n in in_country
+               if (n.get("region_key") or "") == tgt.get("key")
+               and n.get("lat") is not None and n.get("lon") is not None]
+        if pts:
+            tgt["lat"] = sum(p[0] for p in pts) / len(pts)
+            tgt["lon"] = sum(p[1] for p in pts) / len(pts)
+    if not tgt.get("name"):
+        tgt["name"] = region
+    return tgt
+
+
+# ----------------------------------------------------------------------------
+# 降级前先重扫当前地区
+# ----------------------------------------------------------------------------
+# 需求：切到下一个地区之前，先扫一下当前地区有没有新节点；有新的就不切。
+# 为什么需要：节点池默认 10 分钟才拉一次（FETCH_INTERVAL），东京都在这中间
+# 新上线了节点、或原来失败的节点恢复了，只按旧池子判断就会"明明还有货却退走了"。
+# 做法：**在真的要用降级节点之前**，对"当前所在的那个县"做一次限流的局部重扫：
+#   1. 先看池子里这个县还有没有可用节点（够用就根本不用扫）；
+#   2. 池子够新（REGION_RESCAN_MAX_AGE 内）就只用当前池子算，不重复联网；
+#   3. 否则拉一次节点（refresh_nodes_once，含 IP 富化），再看这个县有没有货；
+#   4. 有 -> 留在当前县；没有 -> 才算"真的没货"，继续按固定顺序往下退。
+# 每个县有冷却时间，并发时只有一个真去拉，其它直接复用结果。
+# 注意：重扫一律在 node_pick_lock **之外**做 —— 否则会排队等一次网络拉取。
+# ----------------------------------------------------------------------------
+_rescan_lock = threading.Lock()          # 保护 _rescan_at（每个县上次重扫的时间）
+_rescan_at: dict[str, float] = {}
+_refresh_run_lock = threading.Lock()     # 保证同一时刻只有一个线程在真拉节点
+
+
+def _pool_snapshot() -> list[dict]:
+    with nodes_cache_lock:
+        return list(nodes_cache)
+
+
+def _region_free(pool: list[dict], key: str,
+                 taken: set[str] | frozenset = frozenset(),
+                 ip_type: str = "") -> list[dict]:
+    """某个县当前"真能用"的节点：命中该县 + 未被占用 + 不在失败跳过期内。
+
+    ip_type 非空时**只算这个类型**。这一步是"住宅模式下不拿机房 IP 顶替"的地基：
+    如果这里把机房节点也算成"有货"，上层就会认为该县还有节点，既不降级、
+    也不重扫，最后只能放宽类型选中一个机房 IP —— 正是用户不想要的结果。
+    """
+    key = (key or "").strip().upper()
+    if not key:
+        return []
+    tk = type_key(ip_type)
+    return [n for n in pool
+            if (n.get("region_key") or "").strip().upper() == key
+            and n.get("ip") not in taken
+            and (not tk or (n.get("ip_type") or "") == tk)
+            and not is_node_skipped(n.get("ip", ""))]
+
+
+def rescan_region(country: str, region: str, need: int = 1,
+                  taken: set[str] | None = None, tag: str = "",
+                  wait: bool = False, ip_type: str = "") -> dict:
+    """【降级前】重扫指定行政区，确认它是真没货，而不是"池子太旧"。
+
+    ip_type 非空时只算该类型 —— "住宅模式下东京都还有 5 个机房节点"不算有货，
+    仍然要按顺序往就近的县走，而不是留在这儿用机房 IP。
+
+    返回 {"ok", "found", "total", "new", "refreshed", "reason", "key", "name", "ip_type"}
+      ok        True = 当前地区仍有可用节点，调用方应当**不要**降级
+      found     重扫后该县可用节点数（已按 ip_type 过滤）
+      total     重扫后该县节点总数（同口径，含被占用/被跳过的，用于说明"有节点但都不可用"）
+      new       本次刷新新拉到的该县节点数（0 表示没发现新节点）
+      refreshed 是否真的联网拉了一次（False = 池子还新鲜 / 冷却中 / 被禁用）
+      reason    enough / found / none / cooldown / busy / disabled / no_target / failed
+    """
+    tk = type_key(ip_type)
+    tlabel = ip_type_label(tk)
+    res = {"ok": False, "found": 0, "total": 0, "new": 0, "refreshed": False,
+           "reason": "", "key": "", "name": "", "ip_type": tk}
+    if not REGION_RESCAN_ENABLED:
+        res["reason"] = "disabled"
+        return res
+    tgt = region_target(country, region)
+    if not tgt:
+        res["reason"] = "no_target"
+        return res
+    key = (tgt.get("key") or "").strip().upper()
+    res["key"], res["name"] = key, tgt.get("name") or region
+    taken = set(taken or ())
+
+    def tally(pool: list[dict]) -> tuple[int, int]:
+        in_region = [n for n in pool
+                     if (n.get("region_key") or "").strip().upper() == key
+                     and (not tk or (n.get("ip_type") or "") == tk)]
+        return len(_region_free(pool, key, taken, tk)), len(in_region)
+
+    pool = _pool_snapshot()
+    found, total = tally(pool)
+    res["found"], res["total"] = found, total
+    if found >= max(1, need):                    # 池子里还有货，根本不需要重扫
+        res["ok"], res["reason"] = True, "enough"
+        return res
+
+    now = time.time()
+    ck = f"{(country or '').strip()}|{key}"
+    with _rescan_lock:
+        if now - _rescan_at.get(ck, 0.0) < REGION_RESCAN_COOLDOWN:
+            res["reason"] = "cooldown"           # 刚扫过还是没货，别反复拉
+            return res
+        _rescan_at[ck] = now                      # 先占位，防并发通道同时开拉
+
+    who = f"[rescan {tag}]" if tag else "[rescan]"
+    refreshed = False
+    if (time.time() - _nodes_refreshed_at) > REGION_RESCAN_MAX_AGE:
+        got = (_refresh_run_lock.acquire(timeout=REGION_RESCAN_WAIT) if wait
+               else _refresh_run_lock.acquire(blocking=False))
+        if not got:
+            # 别的通道正在拉：单通道路径不等（等一次网络拉取会拖慢连接），
+            # 直接用当前池子算结论；等它拉完，下一条通道自然用上新池子。
+            res["reason"] = "busy"
+        else:
+            try:
+                if (time.time() - _nodes_refreshed_at) > REGION_RESCAN_MAX_AGE:
+                    before = {n.get("id") for n in _pool_snapshot() if n.get("id")}
+                    refresh_nodes_once("rescan")
+                    refreshed = True
+                    after = _pool_snapshot()
+                    new_ids = {n.get("id") for n in after if n.get("id")} - before
+                    res["new"] = sum(1 for n in after
+                                     if n.get("id") in new_ids
+                                     and (n.get("region_key") or "").strip().upper() == key
+                                     and (not tk or (n.get("ip_type") or "") == tk))
+            except Exception as e:               # noqa: BLE001 - 重扫失败不能阻断选节点
+                res["reason"] = "failed"
+                log(f"{who} {country} {res['name']} 重扫失败（{e}），沿用当前节点池继续判断")
+            finally:
+                _refresh_run_lock.release()
+    res["refreshed"] = refreshed
+    found, total = tally(_pool_snapshot())
+    res["found"], res["total"] = found, total
+    res["ok"] = found >= 1
+
+    if res["ok"]:
+        res["reason"] = "found"
+        if found >= max(1, need):
+            extra = f"（新上线 {res['new']} 个）" if res["new"] else ""
+            log(f"{who} {country} {res['name']} 重扫后又有了 {found} 个"
+                f"{tlabel + '节点' if tlabel else '可用节点'}{extra}，"
+                f"本次不降级，继续留在{res['name']}")
+        else:
+            extra = f"，其中新上线 {res['new']} 个" if res["new"] else ""
+            log(f"{who} {country} {res['name']} 重扫后可用 {found} 个{extra}"
+                f"{'（只算' + tlabel + ' IP）' if tlabel else ''}"
+                f"（需要 {need} 个），先用掉这些，剩下的再按固定顺序递补")
+    else:
+        if res["reason"] not in ("busy", "failed"):
+            res["reason"] = "none"
+        if refreshed:
+            what = (f"没有可用的{tlabel}节点" if tlabel else "没有可用节点")
+            log(f"{who} {country} {res['name']} 重扫后仍然{what}"
+                f"（池内 {total} 个{'' if not tlabel else tlabel + '节点'}，"
+                f"全部被占用或刚失败被跳过），按固定顺序递降")
+    return res
+
+
+def _pick_taken(exclude_ch: "Channel | None" = None,
+                exclude_ips: set | None = None) -> set[str]:
+    taken = occupied_ips(exclude_ch)
+    if exclude_ips:
+        taken |= set(exclude_ips)
+    return taken
+
+
+def _maybe_rescan_for_pick(country: str, tgt: dict, lock_key: str,
+                           exclude_ch: "Channel | None" = None,
+                           exclude_ips: set | None = None,
+                           ip_type: str = "") -> dict | None:
+    """"这条通道要降级了吗？" —— 是的话先在**当前所在的县**上重扫一次。
+
+    当前所在县 = region_lock（已经退到的位置）优先，否则就是目标县。
+    这一步很关键：用户要求"东京都又有新 IP 也不切回"，所以重扫的必须是
+    锁定后的那个县，不能因为东京都有货就把通道拉回去。
+
+    ip_type 透传下去：住宅模式下"这个县只剩机房节点"不算有货，必须继续递降。
+    """
+    cur = (lock_key or (tgt.get("key") or "")).strip().upper()
+    if not cur:
+        return None
+    tk = type_key(ip_type)
+    taken = _pick_taken(exclude_ch, exclude_ips)
+    if _region_free(_pool_snapshot(), cur, taken, tk):   # 还有可用的，不用扫
+        return None
+    who = f"CH{exclude_ch.index}" if exclude_ch is not None else "pick"
+    return rescan_region(country, cur, need=1, taken=taken, tag=who,
+                         wait=False, ip_type=tk)
+
+
+# 档位常量：优先链用 0..N（数字=链上第几位），其余用大一点的固定值，
+# 这样以后往链上插县不用改任何比较代码。
+TIER_ZONE = 20          # 同一大区（关东等），按距离
+TIER_COUNTRY = 21       # 本国其它地区，按距离
+TIER_UNKNOWN = 22       # 双方都没有坐标，只能靠原有质量排序
+TIER_AVOID = 90         # 已经降级落地过：原目标县放到最后，不再切回去
+
+
+def region_rank(node: dict, tgt: dict, locked: str = "") -> tuple[int, float]:
+    """节点相对目标行政区的排序键，越小越优先。
+
+    (0, 0)        命中目标县（或已锁定的县 —— 那已经是这条通道当前的"目标"）
+    (1..N, 0)     按固定顺序递补的第 2、3…顺位（日本东京都：埼玉/神奈川/千叶/山梨）
+    (20, 距离)    同一大区（如关东）内，按距离
+    (21, 距离)    其它地区，按距离
+    (22, 0)       双方都没有坐标，只能靠原有质量排序
+    (90, 0)       已降级后要避开的原目标县：只有全日本都没别的可用节点时才回到它
+
+    locked：这条通道**实际落地**的县键。一旦因降级落到别处，就锁在那儿：
+    重连先回这个县，它也没了才按固定顺序往后推，而原来的目标县被压到 90 档
+    —— 这正是"就算东京都又有新 IP 进来，也不切回东京都"的实现。
+    """
+    nk = (node.get("region_key") or "").strip().upper()
+    want = str(tgt.get("key") or "").strip().upper()
+    lock = (locked or "").strip().upper()
+    chain = region_geo.near_first_chain(want)
+    avoided: set[str] = set()
+    if lock and lock != want:
+        if lock in chain:
+            idx = chain.index(lock)
+            avoided = set(chain[:idx])      # 锁位之前的（含原目标县）不再主动回切
+            chain = chain[idx:]
+        else:
+            # 链外落点（比如别的国家自定义区、或用户手点过的县）：先留在这个县
+            chain = [lock] + chain
+    if nk and nk in chain:
+        return (chain.index(nk), 0.0)
+    if nk and nk in avoided:
+        return (TIER_AVOID, 0.0)
+    dist = region_geo.haversine_km(tgt.get("lat"), tgt.get("lon"),
+                                   node.get("lat"), node.get("lon"))
+    zone = node.get("region_zone") or region_geo.zone_of_key(nk)
+    if tgt.get("zone") and zone and zone == tgt["zone"]:
+        return (TIER_ZONE, dist if dist is not None else 1e6)
+    if dist is not None:
+        return (TIER_COUNTRY, dist)
+    return (TIER_UNKNOWN, 0.0)
+
+
+def region_key_of(raw: str, country: str = "") -> str:
+    """把面板/配置里的县（键、中文名、日文名、英文名都行）统一成键。"""
+    t = region_geo.resolve_target(raw, country)
+    return (t or {}).get("key", "").upper() if t else ""
+
+
+def region_display(raw: str) -> str:
+    """县键（JP-11）-> 中文名（埼玉县）。认不出来就原样返回。
+
+    to_dict 里带上它，面板首屏就能显示中文名，不用等县级下拉的 /api/regions 回来。
+    """
+    if not raw:
+        return ""
+    pref = region_geo.lookup_prefecture(raw)
+    return pref["name"] if pref else raw
+
+
+
+def _region_gap_text(node: dict, tgt: dict) -> str:
+    """降级说明："千叶县（约 32km）"。用于日志和面板提示。"""
+    name = node.get("region") or "未知地区"
+    dist = region_geo.haversine_km(tgt.get("lat"), tgt.get("lon"),
+                                   node.get("lat"), node.get("lon"))
+    return f"{name}（约 {dist:.0f}km）" if dist is not None else name
+
+
+def _region_spill_text(picked: list[tuple[str, dict]], tgt: dict,
+                       country: str, ip_type: str = "") -> str:
+    """把"一部分落在目标县、其余就近降级"的结果写成一句人话。
+
+    ip_type 非空时在句尾点明"只算这一类 IP"——降级是"该县没有住宅 IP"，
+    不是"该县没有节点"，两者对用户来说差别很大。
+    """
+    in_country = [(c, n) for c, n in picked if c == country]
+    exact = [n for _, n in in_country if region_rank(n, tgt)[0] == 0]
+    used_regions: dict[str, int] = {}
+    first_near = None
+    for _, n in in_country:
+        if region_rank(n, tgt)[0] == 0:
+            continue
+        nm = n.get("region") or "未知地区"
+        used_regions[nm] = used_regions.get(nm, 0) + 1
+        if first_near is None:
+            first_near = n
+    tk = type_key(ip_type)
+    tlabel = ip_type_label(tk)
+    unit = f"{tlabel}节点" if tlabel else "可用节点"
+    head = (f"{country} {tgt['name']} 只有 {len(exact)} 个{unit}"
+            if exact else f"{country} {tgt['name']} 当前没有{unit}")
+    if not used_regions or set(used_regions) == {"未知地区"}:
+        # 整池都没有行政区数据（IP 情报还没跑完 / 查询失败）—— 这时候说"就近降级"
+        # 是假话，直说原因，别让人以为位置真的算过。
+        return (head + "；节点池里还没有县/州信息（IP 情报未完成或查询失败），"
+                "本次按原有质量顺序分配；稍后点「刷新」可补上县信息")
+    parts = [f"{nm}×{cnt}" for nm, cnt in
+             sorted(used_regions.items(), key=lambda kv: -kv[1])]
+    tail = f"；其余 {len(in_country) - len(exact)} 条已自动就近降级：{'、'.join(parts)}"
+    if first_near is not None:
+        gap = _region_gap_text(first_near, tgt)
+        if "约" in gap:
+            tail += f"；最近的是 {gap}"      # gap 自己已带括号，这里不要再套一层
+    chain = region_geo.near_first_names(tgt["key"])
+    if len(chain) > 1:
+        tail += f"（固定递补顺序：{' → '.join(chain)} → 其它地区由近到远）"
+    if tlabel:
+        tail += f"（只算{tlabel} IP，其它类型不参与降级）"
+    return head + tail + "（出口 IP 仍互不重复）"
+
+
+def region_supply(country: str, ip_type: str = "") -> list[dict]:
+    """该国各行政区（县/州）的节点供给，用于面板下拉与提示。
+
+    日本会把 47 个都道府县**全部**列出来（即使当前 0 个节点）——
+    否则用户想选"东京都"却因为没有节点在下拉里找不到，就没法触发"就近降级"。
+    """
+    with nodes_cache_lock:
+        pool = list(nodes_cache)
+    used = set(occupied_map())
+    key_filter = type_key(ip_type)
+    cc = ""
+    out: dict[str, dict] = {}
+    for n in pool:
+        if not _country_match(n, country):
+            continue
+        if not cc and n.get("country_code"):
+            cc = str(n["country_code"])
+        if key_filter and (n.get("ip_type") or "") != key_filter:
+            continue
+        rkey = n.get("region_key") or ""
+        if not rkey:
+            continue
+        e = out.setdefault(rkey, {"key": rkey, "name": n.get("region") or rkey,
+                                  "zone": n.get("region_zone") or "",
+                                  "total": 0, "used": 0,
+                                  "_lat": [], "_lon": []})
+        e["total"] += 1
+        if n.get("ip") in used:
+            e["used"] += 1
+        if n.get("lat") is not None and n.get("lon") is not None:
+            e["_lat"].append(n["lat"])
+            e["_lon"].append(n["lon"])
+    for p in region_geo.options_for(country, cc):
+        e = out.setdefault(p["key"], {"key": p["key"], "name": p["name"],
+                                      "zone": p["zone"], "total": 0, "used": 0,
+                                      "_lat": [], "_lon": []})
+        e["name"] = p["name"]
+        e["zone"] = p["zone"]
+        e["lat"] = p["lat"]
+        e["lon"] = p["lon"]
+    rows = []
+    for e in out.values():
+        if "lat" not in e:
+            e["lat"] = sum(e["_lat"]) / len(e["_lat"]) if e["_lat"] else None
+            e["lon"] = sum(e["_lon"]) / len(e["_lon"]) if e["_lon"] else None
+        e.pop("_lat", None)
+        e.pop("_lon", None)
+        e["free"] = max(0, e["total"] - e["used"])
+        rows.append(e)
+    # 有可用节点的排前面（按可用数），其余按都道府县码顺序保持稳定
+    rows.sort(key=lambda x: (0 if x["total"] else 1, -x["free"], x["key"]))
+    return rows
+
+
+def _plan_taken(targets: list["Channel"]) -> set[str]:
+    """规划时要排除的已占 IP：不包含本次要重新分配的通道（它们原来的 IP 可以回收）。"""
+    target_ids = {c.index for c in targets}
+    out: set[str] = set()
+    for c in channels:
+        if c.index in target_ids:
+            continue
+        ip = c.reserved_ip or c.node_ip
+        if ip and (c.reserved_ip or c.state in ("connected", "connecting")):
+            out.add(ip)
+    return out
+
+
+def build_assign_plan(targets: list["Channel"], mode: str = "country",
+                      ip_type: str = "", country: str = "",
+                      fill: bool = False, region: str = "") -> dict:
+    """规划一组互不重复的出口节点。
+
+    mode=country: 尽量让每条通道落在不同国家（按该国可用节点数从多到少分配）；
+                  国家凑不够时，在剩余节点最多的国家上多开通道，但出口 IP 仍然互不重复。
+    mode=same:    所有通道都固定到 country 指定的同一个国家/地区，只要求出口 IP 互不重复；
+                  该国可用节点不够时默认只分配够用的条数（fill=True 才用其它国家补满）。
+    mode=ip:      不限国家，只保证每条通道拿到一个不同的出口 IP。
+    region:       仅 mode=same 有意义 —— 在指定国家里再精确到行政区（日本=都道府县）。
+                  优先全部分到该县；该县可用节点不够时按"同大区 -> 全国按距离"就近递补，
+                  这就是需求里的"东京都没 IP 就就近，再没有往下推"。
+    ip_type:      指定了就**严格**按这个类型挑。判断"这个县还有没有货"同样只算该类型 ——
+                  住宅模式下该县只剩机房节点，等于没货，照样往就近的县降级；
+                  全站都没有该类型时直接返回空计划并说明，而不是拿机房 IP 顶上。
+
+    VPNGate 是志愿者网络，有节点的国家通常只有十来个，所以"每个国家一个出口"经常凑不齐 ——
+    真正能稳定做到的是"出口 IP 不重复"，这也是本函数的主目标。
+    """
+    want_country = (country or "").strip()      # mode=same 时指定的固定国家
+    want_region = (region or "").strip()        # mode=same 时可再指定行政区（县/州）
+    tk = type_key(ip_type)                      # 空 = 不限类型；非空 = 严格只算这一类
+
+    # —— 降级前先重扫当前地区：池子里这个县不够用时，先拉一次节点看看有没有新上线 ——
+    # 这一步必须在下面 snapshot pool 之前做，否则重扫到的新节点进不了本次规划。
+    # 预览（dry_run）也走这里：用户在面板上点"预览"时看到的降级，必须是"真的没货"。
+    # 注意带 tk：住宅模式下"该县还有几个机房节点"不算有货，不能因此跳过重扫/降级。
+    rescan_info: dict | None = None
+    free_before = 0
+    if mode == "same" and want_country and want_region:
+        tgt0 = region_target(want_country, want_region)
+        if tgt0:
+            taken0 = _plan_taken(targets)
+            free_before = len(_region_free(_pool_snapshot(), tgt0.get("key"), taken0, tk))
+            if free_before < max(1, len(targets)):
+                rescan_info = rescan_region(want_country, want_region,
+                                            need=len(targets), taken=taken0,
+                                            tag="plan", wait=True, ip_type=tk)
+
+    with nodes_cache_lock:
+        pool = list(nodes_cache)
+    warnings: list[str] = []
+    note = ""                                   # 成功时的正向说明（前端绿框展示）
+    region_rows: list[dict] = []                # 目标国家各行政区的供给（前端展示用）
+    tgt: dict | None = None                     # 目标行政区（都道府县/州）
+    if not pool:
+        return {"plan": [], "warnings": ["节点池为空，请先点「获取节点」"],
+                "countries": {}, "note": ""}
+
+    if tk:
+        typed = [n for n in pool if (n.get("ip_type") or "") == tk]
+        if typed:
+            pool = typed
+        else:
+            # 严格模式：绝不静默放宽成"全部类型"。原实现会在这里退回整个池子，
+            # 结果"住宅"设定静默变成"机房"，用户看到的只是"降级没生效"，
+            # 根本想不到是类型被放宽了。
+            pending = sum(1 for n in pool if not (n.get("ip_type") or ""))
+            hint = (f"；池内有 {pending} 个节点还没判定出 IP 类型，可能还在判定中，"
+                    f"等几秒点「获取节点」重试" if pending else "")
+            return {"plan": [], "note": "",
+                    "warnings": [f"当前节点池里没有「{ip_type_label(tk)}」类型的节点，"
+                                 f"已排除其它类型（含机房 IP），本次不分配{hint}"],
+                    "countries": country_supply(tk)}
+
+    # 本次要重新分配的通道，它们原先占的 IP 可以回收
+    target_ids = {c.index for c in targets}
+    used: set[str] = _plan_taken(targets)
+
+    buckets: dict[str, list[dict]] = {}
+    excl_buckets: dict[str, list[dict]] = {}    # 被默认排除的国家，只有用户显式点名才启用
+    for n in pool:
+        cname = (n.get("country_long") or "").strip()
+        if not cname:
+            continue
+        if is_excluded_country(cname):
+            excl_buckets.setdefault(cname, []).append(n)
+            continue
+        buckets.setdefault(cname, []).append(n)
+    if not buckets and not excl_buckets:
+        return {"plan": [], "warnings": ["节点池里没有可用的国家信息"],
+                "countries": {}, "note": ""}
+
+    order = sorted(buckets, key=lambda c: -len(buckets[c]))
+    promoted = 0                                # 被显式启用的排除国家节点数
+
+    def free_count(cname: str) -> int:
+        """该国当前还有几个没被其它通道占用/预占的 IP。"""
+        return sum(1 for n in (buckets.get(cname) or ()) if n.get("ip") not in used)
+
+    def take(cname: str) -> dict | None:
+        for n in buckets[cname]:            # 池内已按速度排序，取第一个未占用的即"该国最优可用"
+            if n.get("ip") not in used:
+                used.add(n["ip"])
+                return n
+        return None
+
+    picked: list[tuple[str, dict]] = []
+    if mode == "same":
+        # —— 所有通道固定同一个国家/地区，只要求出口 IP 互不重复 ——
+        if not want_country:
+            return {"plan": [], "note": "", "countries": country_supply(tk),
+                    "warnings": ["请先选择要用哪个国家/地区"]}
+        low = want_country.lower()
+        match = None
+        for c in buckets:                       # 精确 -> 忽略大小写 -> 子串
+            if c == want_country:
+                match = c
+                break
+        if match is None:
+            for c in buckets:
+                if c.lower() == low:
+                    match = c
+                    break
+        if match is None:
+            for c in buckets:
+                if low in c.lower() or c.lower() in low:
+                    match = c
+                    break
+        if match is None:
+            for c in excl_buckets:              # 点名的国家在默认排除名单里 -> 尊重显式选择
+                if c.lower() == low:
+                    match = c
+                    buckets[c] = excl_buckets[c]
+                    promoted = len(excl_buckets[c])
+                    warnings.append(f"「{c}」在默认排除名单里（VPNGate 上的 CN 节点多为境内家宽，"
+                                    f"当境外出口通常没有意义），此处按你的明确指定仍然使用")
+                    break
+        if match is None:
+            known = sorted(buckets, key=lambda c: -free_count(c))[:6]
+            return {"plan": [], "note": "", "countries": country_supply(tk),
+                    "warnings": [f"节点池里没有「{want_country}」的节点（可能当前全部离线）"
+                                 + (f"；当前在线有节点的国家/地区：{'、'.join(known)}"
+                                    if known else "")]}
+        need = len(targets)
+        # —— 行政区（县/州）优先：同县 -> 同大区按距离 -> 全国按距离 ——
+        tgt = region_target(match, want_region) if want_region else None
+        if want_region and tgt is None:
+            warnings.append(f"没能识别「{want_region}」对应哪个县/州，本次在「{match}」全国范围内分配")
+        if want_region:
+            region_rows = region_supply(match, tk)
+        if tgt:
+            ranked = sorted(buckets[match], key=lambda n: region_rank(n, tgt))
+            for n in ranked:
+                if len(picked) >= need:
+                    break
+                if n.get("ip") in used:       # 已被其它通道占用/预占
+                    continue
+                used.add(n["ip"])
+                picked.append((match, n))
+        else:
+            while len(picked) < need:               # 先尽力把该国可用 IP 都占上
+                n = take(match)
+                if not n:
+                    break
+                picked.append((match, n))
+        short = need - len(picked)
+        if short <= 0:
+            if tgt:
+                exact = sum(1 for c, n in picked
+                            if c == match and region_rank(n, tgt)[0] == 0)
+                cnt = sum(1 for n in buckets[match] if region_rank(n, tgt)[0] == 0)
+                unit = f"{ip_type_label(tk)}节点" if tk else "节点"
+                note = ((f"已选定 {match} {tgt['name']}（该县当前 {cnt} 个{unit}）" if need == 1 else
+                         f"{need} 条通道全部使用 {match} {tgt['name']}"
+                         f"（该县当前 {cnt} 个{unit}），出口 IP 互不重复"))
+                if exact < need:
+                    note = ""   # 有降级，绿色"全中"提示不合适，转成下面的黄色警告
+                    warnings.append(_region_spill_text(picked, tgt, match, tk))
+            else:
+                unit = f"{ip_type_label(tk)}节点" if tk else "节点"
+                note = ((f"已选定 {match}（该国共 {len(buckets[match])} 个{unit}）" if need == 1 else
+                         f"{need} 条通道全部使用 {match}"
+                         f"（该国共 {len(buckets[match])} 个{unit}），出口 IP 互不重复"))
+        elif fill:
+            if tgt:
+                warnings.append(_region_spill_text(picked, tgt, match, tk))
+            others = sorted([c for c in buckets if c != match],
+                            key=lambda c: -free_count(c))
+            while len(picked) < need:           # 轮转其它国家补满
+                progressed = False
+                for c in others:
+                    if len(picked) >= need:
+                        break
+                    n2 = take(c)
+                    if n2:
+                        picked.append((c, n2))
+                        progressed = True
+                if not progressed:
+                    break
+            mixed = sorted({c for c, _ in picked if c != match})
+            warnings.append(f"「{match}」只有 {need - short} 个未被占用的节点，不够 {need} 条通道；"
+                            f"已用 {'、'.join(mixed)} 的节点补满剩余 "
+                            f"{len(picked) - (need - short)} 条（出口 IP 仍互不重复）")
+            if len(picked) < need:
+                warnings.append(f"全站可用节点也不够，仍有 {need - len(picked)} 条通道未分配")
+        else:
+            if tgt:
+                warnings.append(_region_spill_text(picked, tgt, match, tk))
+            enough = [c for c in sorted(buckets, key=lambda c: -free_count(c))
+                      if c != match and free_count(c) >= short]
+            if need == 1:
+                unit = f"{ip_type_label(tk)}节点" if tk else "节点"
+                warnings.append(f"「{match}」当前没有可用的{unit}（或都已被占用），没能排上出口；"
+                                f"换个国家/地区，或把「出口 IP 类型」放宽为「不限」再试")
+            else:
+                warnings.append(f"「{match}」当前只有 {need - short} 个未被其它通道占用的节点，"
+                                f"填不满 {need} 条通道；未列出的通道保持原样不变")
+            if enough:
+                warnings.append("可用节点够填满的国家/地区：" + "、".join(
+                    f"{c}({free_count(c)})" for c in enough[:6]))
+            else:
+                warnings.append("当前没有任何国家的可用节点数够填满全部通道：可把"
+                                "「出口 IP 类型」放宽为「不限」（放宽后机房 IP 也会参与），"
+                                "或改用「不限国家，只保证出口 IP 互不重复」")
+    elif mode == "ip":
+        # 轮转各国取，顺手把国家也摊开
+        while len(picked) < len(targets):
+            progressed = False
+            for cname in order:
+                if len(picked) >= len(targets):
+                    break
+                n = take(cname)
+                if n:
+                    picked.append((cname, n))
+                    progressed = True
+            if not progressed:
+                break
+    else:
+        for cname in order:                 # 第一轮：一国一条
+            if len(picked) >= len(targets):
+                break
+            n = take(cname)
+            if n:
+                picked.append((cname, n))
+        while len(picked) < len(targets):   # 第二轮：国家用完，在剩余节点最多的国家多开
+            best_c, best_free = None, 0
+            for cname in order:
+                free = sum(1 for n in buckets[cname] if n.get("ip") not in used)
+                if free > best_free:
+                    best_c, best_free = cname, free
+            if not best_c:
+                break
+            n = take(best_c)
+            if not n:
+                break
+            picked.append((best_c, n))
+
+    plan = []
+    for i, (cname, n) in enumerate(picked):
+        rk = region_rank(n, tgt)[0] if tgt else -1
+        plan.append({
+            "index": targets[i].index,
+            "country": cname,
+            "node_id": n.get("id", ""),
+            "ip": n.get("ip", ""),
+            "owner": n.get("owner", ""),
+            "location": n.get("location", ""),
+            "ip_type": n.get("ip_type", ""),
+            "ip_reason": n.get("ip_reason", ""),
+            "country_total": len(buckets[cname]),
+            # 行政区：region 是节点实际所在县/州；region_tier 0=命中目标县，
+            # >=1 为降级档位，-1 表示本次没有指定目标县（不是"离得很远"）
+            "region": n.get("region", ""),
+            "region_key": n.get("region_key", ""),
+            "region_match": (rk == 0) if tgt else None,
+            "region_tier": rk,
+            "distance_km": (region_geo.haversine_km(tgt.get("lat"), tgt.get("lon"),
+                                                    n.get("lat"), n.get("lon"))
+                            if tgt else None),
+        })
+
+    excl_left = sum(len(v) for v in excl_buckets.values()) - promoted
+    if excl_left > 0:
+        warnings.append(f"已跳过 {excl_left} 个 {'/'.join(sorted(EXCLUDE_COUNTRIES))} 节点"
+                        f"（如需使用可在面板上手动指定，或设 VPNGATE_EXCLUDE_COUNTRIES=）")
+    if len(plan) < len(targets) and mode != "same":
+        warnings.append(f"可用节点只剩 {len(plan)} 个，未能填满 {len(targets)} 条通道；"
+                        f"建议把部分通道设成「自动选择」或先「获取节点」")
+    if mode == "country":
+        distinct = [c for c in order if c in {p["country"] for p in plan}]
+        if len(distinct) < len(plan):
+            warnings.append(
+                f"当前在线节点只覆盖 {len(buckets)} 个国家/地区，凑不出 {len(plan)} 个不同国家；"
+                f"已在节点较多的 {'、'.join(distinct[:4])} 等处多开通道，出口 IP 互不重复")
+        for cname in distinct:
+            if len(buckets[cname]) <= 2:
+                warnings.append(f"{cname} 只有 {len(buckets[cname])} 个节点，该通道掉线后可能无备选节点")
+    # 把"降级前重扫"的结果说出来 —— 否则用户看不出"这次为什么没退到埼玉"，
+    # 或者"为什么明明东京都还有节点却退走了"（后者说明重扫过也不够用）。
+    if rescan_info:
+        nm = rescan_info.get("name") or want_region
+        after = rescan_info.get("found", 0)
+        if rescan_info.get("ok") and rescan_info.get("new"):
+            tip = (f"降级前重扫了{nm}：新上线 {rescan_info['new']} 个节点，"
+                   f"可用数从 {free_before} 增加到 {after}，已优先留在该县")
+            if note:
+                note += "；" + tip
+            else:
+                warnings.insert(0, tip)
+        elif rescan_info.get("ok"):
+            warnings.insert(0, f"降级前重扫{nm}：可用节点从 {free_before} 增加到 {after}，"
+                               f"已优先使用，没有继续往下退")
+        elif rescan_info.get("reason") == "failed":
+            warnings.insert(0, f"降级前想重扫{nm}，但节点刷新失败，本次按现有节点池判断")
+        elif rescan_info.get("reason") == "none":
+            warnings.insert(0, f"降级前已重扫{nm}：确认当前没有可用节点"
+                               f"（池内 {rescan_info.get('total', 0)} 个，全部被占用或刚失败）")
+        # cooldown / busy / disabled：刚扫过或别的通道正在扫，不必再解释一遍
+
+    return {"plan": plan, "warnings": warnings, "note": note,
+            "countries": country_supply(tk),
+            "regions": region_rows,
+            "region": tgt["name"] if tgt else "",
+            # 固定递补顺序（如 东京都→埼玉→神奈川→千叶→山梨），面板直接照着显示，
+            # 让人一眼看出"没拿到东京都时按什么顺序往下退"。
+            "region_chain": region_geo.near_first_names(tgt["key"]) if tgt else []}
+
+
+
+def _country_candidates(country: str, ip_type: str = "") -> tuple[list[dict], list[dict]]:
+    """返回 (该国全部候选, 再叠加 IP 类型过滤后的候选)。country 为空即全量池。"""
+    with nodes_cache_lock:
+        candidates = list(nodes_cache)
+    base = [n for n in candidates if _country_match(n, country)] if country else candidates
+    typed = [n for n in base if n.get("ip_type") == ip_type] if ip_type else base
+    return base, typed
+
+
+node_pick_lock = threading.Lock()   # "读占用表 + 预占 IP" 必须原子，否则并发时会撞 IP
+
+# "全国都没有这个类型的节点"是持续状态：看门狗每 15 秒重试一次，不能每次都刷日志。
+# 按 (国家, 类型) 节流到 NO_NODE_LOG_INTERVAL，和看门狗原有的"无可用节点"告警同频。
+_no_typed_log_at: dict[tuple[str, str], float] = {}
+
+
+def _log_no_typed_node(country: str, ip_type: str) -> None:
+    tk = type_key(ip_type)
+    if not tk:
+        return
+    ck = ((country or "").strip(), tk)
+    now = time.time()
+    if now - _no_typed_log_at.get(ck, 0.0) < NO_NODE_LOG_INTERVAL:
+        return
+    _no_typed_log_at[ck] = now
+    where = ck[0] or "全站"
+    log(f"[pick] {where} 没有可用的{ip_type_label(tk)}节点"
+        f"（已排除机房等其它类型，不会拿它们顶替）；"
+        f"换国家/放宽「出口 IP 类型」后再试，或等新节点上线")
+
+
+def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set = None,
+                              exclude_ch: "Channel | None" = None,
+                              allow_reuse: bool = True, region: str = "",
+                              locked: str | None = None) -> dict | None:
+    """挑一个出口节点，**优先挑没被其它通道占用的 IP**。
+
+    选定后立刻写入 exclude_ch.reserved_ip 占位，保证并发场景下各拿一个不同 IP。
+    只有该国未占用节点耗尽时才会复用(此时该通道会亮"IP重复"提示)。
+
+    指定国家当前一个可用候选都没有时，会**自动放宽到全池**随便挑一个可用的
+    （不拉黑、不死等），日志会写明"已自动放宽到 XX"。
+
+    region 非空时在这之前还有一层"行政区优先"：先用目标县/都道府县的节点；
+    该县没可用节点就按"固定顺序（东京都：埼玉 -> 神奈川 -> 千叶 -> 山梨） ->
+    同大区 -> 全国由近到远"递补 —— 这就是"东京都没 IP 就就近选、再没有再往下推"。
+    每次降级都会写日志，面板上也能看到落在哪个县。
+
+    ip_type 指定了就**严格**：住宅模式下只挑住宅节点，"东京都还剩机房节点"不算有货，
+    会照常往埼玉/神奈川降级；全站（含其它国家）都没有该类型时返回 None，
+    由调用方保持原状 —— **绝不拿机房 IP 顶替**。
+
+    locked：通道**已经落地锁定的县**（键）。不传则自动取 exclude_ch.region_lock，
+    显式传 "" 表示忽略锁定（面板上重新指定县时就是这种情况）。
+    锁定后重连只在这个县及其之后的顺位里挑，**不会因为原目标县恢复可用就切回去**。
+    """
+    tk = type_key(ip_type)
+    tgt = region_target(country, region) if region else None
+    if not tgt:
+        lock_key = ""
+    elif locked is None:
+        lock_key = (getattr(exclude_ch, "region_lock", "") or "") if exclude_ch else ""
+    else:
+        lock_key = locked or ""
+    lock_key = lock_key.strip().upper()
+    if tgt:
+        # 「要降级了吗？先扫一眼当前地区」—— 放在 node_pick_lock 之外，
+        # 否则会排队等一次网络拉取（最长几十秒）。
+        _maybe_rescan_for_pick(country, tgt, lock_key, exclude_ch, exclude_ips, tk)
+
+    with node_pick_lock:
+        taken = occupied_ips(exclude_ch)
+        if exclude_ips:
+            taken |= set(exclude_ips)
+        base, typed = _country_candidates(country, tk)
+        # 严格模式：primary 只含指定类型；不限类型时就是全部候选
+        primary = typed if tk else base
+        if not primary and not country:   # 池子本身是空的；指定国家没节点时继续走下面的"放宽"
+            if tk:
+                _log_no_typed_node(country, tk)
+            return None
+
+        def usable(pool: list[dict]) -> list[dict]:
+            # 刚连不上的节点（短期跳过内）先不选，避免同一轮反复去撞同一个死节点。
+            return [n for n in pool if not is_node_skipped(n.get("ip", ""))]
+
+        def choose(pool: list[dict]) -> dict | None:
+            free = [n for n in usable(pool) if n.get("ip") not in taken]
+            if not free:
+                return None
+            # 只在最快的前若干节点里随机：既保证链路质量，又让各通道自然分散到不同节点
+            return random.choice(free[:min(len(free), 12)])
+
+        def choose_near(pool: list[dict]) -> dict | None:
+            """按 region_rank 取最近的；同档且距离相近的几条之间随机。"""
+            free = [n for n in usable(pool) if n.get("ip") not in taken]
+            if not free:
+                return None
+            ranked = sorted(free, key=lambda n: region_rank(n, tgt, lock_key))
+            best = region_rank(ranked[0], tgt, lock_key)
+            group = [n for n in ranked[:24]
+                     if region_rank(n, tgt, lock_key)[0] == best[0]
+                     and abs(region_rank(n, tgt, lock_key)[1] - best[1]) <= 50]
+            return random.choice(group) if len(group) > 1 else ranked[0]
+
+        # 只在 primary（已按 ip_type 严格过滤）里挑：类型不符的节点**不参与**选择，
+        # 否则"东京都只剩机房"时会被就近排序选中机房节点，既没降级又违背了设定。
+        node = choose_near(primary) if tgt else choose(primary)
+        relaxed_from = ""
+        if node is None and country:
+            # 指定的国家当前一个可用候选都没有（比如美国节点掉光了，或仅剩的死节点刚被跳过）。
+            # 按需求**不要死等那一个国家**，直接放宽到全池随便挑个能用的就行。
+            # 仍然排除"自动分配默认不用"的国家（例如境内的 CN），免得"随便跳"反而跳到境内。
+            # 类型仍然是严格的：这里放宽的只是"国家"，不是"IP 类型"。
+            all_base, all_typed = _country_candidates("", tk)
+            cand = all_typed if tk else all_base
+            cand = [n for n in cand if not is_excluded_country(n.get("country_long") or "")]
+            node = choose_near(cand) if tgt else choose(cand)
+            if node is not None:
+                relaxed_from = country
+        reused = False
+        if node is None and allow_reuse:
+            # 未占用耗尽 -> 复用（仍然避开刚失败的节点）。类型照样严格。
+            pool = usable(primary)
+            if not pool and country:                  # 指定国家实在没货，兜底用全池
+                ab, at = _country_candidates("", tk)
+                cand = at if tk else ab
+                pool = usable([n for n in cand
+                               if not is_excluded_country(n.get("country_long") or "")])
+            if pool:
+                if tgt:
+                    # 连"复用已占用的 IP"这一步也走就近排序，否则最后几条会随机
+                    # 跳到很远的地方，和"就近降级"的承诺不一致。
+                    node = sorted(pool, key=lambda n: region_rank(n, tgt, lock_key))[0]
+                else:
+                    node = random.choice(pool)
+                reused = True
+        if node is None:
+            if tk:
+                _log_no_typed_node(country, tk)
+            return None
+
+        # 行政区降级说明：只有真的没落在目标县时才提示，命中目标县就不刷日志
+        if tgt and not relaxed_from:
+            rank, _ = region_rank(node, tgt, lock_key)
+            who = f"CH{exclude_ch.index}" if exclude_ch is not None else "?"
+            want_name = tgt["name"]
+            if lock_key and lock_key != (tgt.get("key") or "").upper():
+                pref = region_geo.lookup_prefecture(lock_key)   # 锁定的县也没货了
+                want_name = f"{pref['name']}（已锁定的县）" if pref else lock_key
+            if not node.get("region"):
+                log(f"[pick {who}] {country} {want_name}：节点还没有县信息可对照，"
+                    f"先按质量顺序选了 {node.get('ip', '')}（IP 情报完成后会自动按距离选）")
+            elif rank == TIER_AVOID:
+                # 锁定县和整条优先链都没货了，只剩"已经降级离开的那个县"
+                log(f"[pick {who}] {country} 除 {node.get('region')} 外已无可用节点，"
+                    f"本次只能回到 {_region_gap_text(node, tgt)} 的节点 {node.get('ip', '')}")
+            elif rank > 0:
+                # 顺位按"原始固定顺序"数（锁定的县会让排序链变短，但人看的还是原顺序）
+                orig = region_geo.near_first_chain((tgt.get("key") or "").upper())
+                nk = (node.get("region_key") or "").upper()
+                if nk and nk in orig:
+                    tail = f"已按固定顺序退到第 {orig.index(nk) + 1} 顺位"
+                else:
+                    tail = "已就近降级到"
+                log(f"[pick {who}] {country} {want_name} 没有可用节点，"
+                    f"{tail} {_region_gap_text(node, tgt)} 的节点 {node.get('ip', '')}")
+
+        if relaxed_from:
+            cname = node.get("country_long") or node.get("country") or "其它国家"
+            log(f"[pick] {relaxed_from} 当前没有可用的"
+                f"{ip_type_label(tk) + '节点' if tk else '候选节点'}，"
+                f"已自动放宽到 {cname} 的节点 {node.get('ip', '')}")
+
+        # 防御性断言：指定类型后所有分支都只从该类型里挑，正常不会走到这里。
+        # 真走到了说明有新代码绕过了 primary 过滤，必须留痕。
+        if tk and (node.get("ip_type") or "") != tk:
+            log(f"[pick] 内部异常: 要求 {ip_type_label(tk)} 节点却选中了 "
+                f"{ip_type_label(node.get('ip_type') or '') or '未知'} 节点 "
+                f"{node.get('ip', '')}，请反馈")
+
+        if exclude_ch is not None:
+            exclude_ch.reserved_ip = node.get("ip", "")
+            exclude_ch.ip_reused = reused
+    if reused:
+        who = f"CH{exclude_ch.index}" if exclude_ch is not None else "?"
+        log(f"[{who}] 警告: {country or '自动选择'} 的未占用节点已用尽，"
+            f"出口 IP {node.get('ip')} 与其它通道重复")
+    return node
+
+def get_node_by_id(node_id: str) -> dict | None:
+    with nodes_cache_lock:
+        for n in nodes_cache:
+            if n.get("id") == node_id: return n
+    return None
+
+# === Web UI ===
+PAGE_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MichaelVPN One</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f0f13;color:#e0e0e0;font-size:14px}
+.hd{padding:16px 20px;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.hd h1{font-size:18px;font-weight:600}
+.bdg{background:#22c55e20;color:#22c55e;font-size:11px;padding:2px 10px;border-radius:10px;border:1px solid #22c55e30}
+.nc{margin-left:auto;color:#6b7280;font-size:13px}
+.grid{padding:12px 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+@media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.grid{grid-template-columns:1fr}}
+.card{background:#1a1a24;border:1px solid rgba(255,255,255,0.06);border-radius:12px;padding:14px}
+.card.on{border-color:#22c55e40;background:#1a2a1e}
+.card.bz{border-color:#f59e0b40;background:#2a2418}
+.card.fail{border-color:#ef444440;background:#2a1818}
+.chf{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.ct{font-size:14px;font-weight:600;display:flex;align-items:center;gap:6px}
+.cn{background:#818cf820;color:#818cf8;font-size:10px;padding:2px 8px;border-radius:6px}
+.dt{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+.dt.g{background:#22c55e;box-shadow:0 0 6px #22c55e60}
+.dt.y{background:#f59e0b;box-shadow:0 0 6px #f59e0b60}
+.dt.r{background:#ef4444;box-shadow:0 0 6px #ef444460}
+.dt.g2{background:#6b7280}
+.bd{font-size:12px;color:#9ca3af;line-height:1.7}
+.ll{color:#6b7280;font-size:11px}
+.ac{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.tog{display:flex;align-items:center;gap:5px;font-size:11px;color:#6b7280;margin-top:8px;cursor:pointer;user-select:none}
+.tog input{cursor:pointer;accent-color:#818cf8}
+.ac select{flex:1;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;padding:6px 8px;font-size:12px;outline:none}
+.ac select:focus{border-color:#818cf8}
+.btn{background:#818cf8;border:none;color:#fff;padding:6px 14px;border-radius:8px;font-size:12px;cursor:pointer;font-weight:500}
+.btn:hover{background:#6d79e8}
+.btn.d{background:#ef4444}.btn.d:hover{background:#dc2626}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.i{display:flex;justify-content:space-between;padding:2px 0}
+.section{margin:12px 16px}
+.ftr{display:flex;gap:10px;margin:8px 16px;flex-wrap:wrap;align-items:center}
+.ftr select{background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;padding:6px 10px;font-size:12px;outline:none}
+.ftr select:focus{border-color:#818cf8}
+.ftr .btn{padding:6px 12px;font-size:12px}
+.tbl{width:100%;border-collapse:collapse;font-size:12px}
+.tbl th{text-align:left;padding:8px 10px;color:#6b7280;font-weight:500;border-bottom:1px solid rgba(255,255,255,0.06);white-space:nowrap;position:sticky;top:0;background:#0f0f13;z-index:1}
+.tbl td{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,0.03);vertical-align:middle}
+.tbl tr:hover{background:rgba(255,255,255,0.02)}
+.tbl tr.isnew{background:rgba(34,197,94,0.05)}
+.tbl tr.isnew:hover{background:rgba(34,197,94,0.09)}
+.sta{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px}
+.sta.ok{background:#22c55e15;color:#22c55e}
+.sta.no{background:#ef444415;color:#ef4444}
+.sta.na{background:#6b728015;color:#6b7280}
+.act-cell{display:flex;gap:4px;flex-wrap:wrap}
+.act-cell .btn{font-size:11px;padding:3px 8px}
+.tp{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px}
+.tp.r{background:#22c55e15;color:#22c55e}
+.tp.h{background:#f59e0b15;color:#f59e0b}
+.tp.m{background:#818cf815;color:#818cf8}
+.tp.u{background:#6b728015;color:#6b7280}
+.ow{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bnw{display:inline-block;padding:0 5px;line-height:15px;border-radius:3px;font-size:10px;
+     background:rgba(34,197,94,0.15);color:#22c55e;border:1px solid rgba(34,197,94,0.35)}
+.mbp{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;background:rgba(129,140,248,0.14);color:#818cf8}
+.mbp.g{background:rgba(34,197,94,0.14);color:#22c55e}
+.bar{height:4px;background:rgba(255,255,255,0.08);border-radius:2px;overflow:hidden;margin-top:6px}
+.bar>i{display:block;height:100%;width:0;background:#22c55e;transition:width .3s}
+.job{margin:0 16px 8px;padding:8px 12px;border-radius:8px;background:rgba(129,140,248,0.08);
+     border:1px solid rgba(129,140,248,0.22);font-size:12px;color:#c7d2fe}
+.cb{width:13px;height:13px;cursor:pointer;accent-color:#22c55e}
+.modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:100;align-items:center;justify-content:center}
+.modal.show{display:flex}
+.modal-c{background:#1a1a24;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:24px;min-width:280px;max-width:400px}
+.modal-c h3{margin-bottom:12px;font-size:15px}
+.modal-c select{width:100%;margin:8px 0;padding:8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:13px}
+.modal-c .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+</style>
+</head>
+<body>
+<div class="hd">
+  <h1>MichaelVPN One</h1>
+  <span class="bdg">单通道</span>
+  <span class="bdg" id="pi" style="cursor:pointer" data-info="{proxy_info_full}" title="{proxy_info_full}" onclick="cpInfo(this)">{proxy_info_short}</span>
+  <span class="bdg" id="oc" title="当前出口 IP 占用情况">出口 0/1</span>
+  <span class="nc" id="nc">节点: 加载中...</span>
+  <button class="btn" style="background:rgba(34,197,94,0.14);border:1px solid rgba(34,197,94,0.3);color:#22c55e" onclick="showAssign()">选择出口</button>
+  <button class="btn" style="background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);color:#e0e0e0" onclick="showAdmin()">管理员</button>
+</div>
+<div class="grid" id="grid"></div>
+
+<div class="section" style="margin-top:0">
+  <div class="ftr">
+    <select id="f_status">
+      <option value="">全部节点</option>
+      <option value="new">只看新节点</option>
+      <option value="available">可用节点</option>
+      <option value="failed">失效节点</option>
+      <option value="tested">已实测</option>
+      <option value="untested">未实测</option>
+    </select>
+    <select id="f_country"><option value="">所有国家</option></select>
+    <select id="f_region" title="按省/州/都道府县筛选"><option value="">所有县/州</option></select>
+    <select id="f_type"><option value="">所有IP类型</option><option value="residential">住宅IP</option><option value="hosting">机房IP</option><option value="mobile">移动IP</option><option value="unknown">未知</option></select>
+    <select id="f_sort" title="排序方式">
+      <option value="">默认排序</option>
+      <option value="new">最新发现优先</option>
+      <option value="latency">实测延迟最低</option>
+      <option value="mbps">实测带宽最高</option>
+      <option value="official">官方速度最高</option>
+    </select>
+    <button class="btn" onclick="refreshNodes()">刷新</button>
+    <button class="btn" onclick="fetchNodes()">获取节点</button>
+    <button class="btn" id="btnPing" onclick="nodePing()" title="对节点 IP:端口做 TCP 握手探测，并发跑，只测连通与延迟，不产生流量">测延迟</button>
+    <button class="btn" id="btnSpeed" onclick="nodeSpeed()" title="用测速专用口（7929，不占用正式端口的隧道）逐个建隧道实测下载带宽，约 15~30 秒/个">测带宽</button>
+    <button class="btn d" id="btnStop" style="display:none" onclick="stopSpeed()">停止测速</button>
+    <button class="btn" onclick="clearNew()" title="把当前所有节点的「新」标记清掉（首现时间记录保留）">清除新标记</button>
+    <button class="btn" onclick="chSpeedAll()" title="对当前已连接的通道并发测速，各走自己的出口">通道测速</button>
+    <span id="rc" style="color:#6b7280;font-size:12px;margin-left:auto"></span>
+  </div>
+  <div class="job" id="job" style="display:none">
+    <span id="job_txt">准备中...</span>
+    <div class="bar"><i id="job_bar"></i></div>
+  </div>
+  <div style="overflow-x:auto">
+  <table class="tbl" id="tbl"><thead><tr>
+    <th style="width:26px"><input type="checkbox" class="cb" id="ckall" onchange="toggleAllNodes(this.checked)" title="全选/全不选"></th>
+    <th>状态</th><th>IP : 端口</th><th>物理位置</th><th>县/州</th><th>运营主体 / ISP</th><th>IP类型</th>
+    <th>实测延迟</th><th>官方速度</th><th>实测带宽</th><th>发现时间</th><th>操作</th>
+  </tr></thead><tbody id="tb"></tbody></table>
+  </div>
+</div>
+
+<div class="modal" id="modal"><div class="modal-c">
+  <h3>切换出口节点</h3>
+  <p style="font-size:12px;color:#9ca3af;margin-bottom:8px" id="m_node_info"></p>
+  <select id="m_ch"></select>
+  <div class="btns">
+    <button class="btn" onclick="switchNode()">确认切换</button>
+    <button class="btn d" onclick="closeModal()">取消</button>
+  </div>
+</div></div>
+
+<script>
+var CH=[]; var CUR_NODE=null;
+var CUR_USER="";  // 当前登录账号，由 /api/status 回填，用于管理弹窗预填
+var _saved={}; // Save dropdown state across renders
+var _CS={},_CST={},_CTRY=[];  // /api/status 带回的国家供给统计，供"全部通道用同一个国家"使用
+                              // _CST 是"按 IP 类型分开"的那一份：{residential:{国家:...}, ...}
+var _REG={};          // {"国家|IP类型": [{key,name,zone,total,free}]} 县级列表缓存（按需拉取）
+var _REGCHAIN={};     // {国家: {县键: [固定递补顺序的中文名]}} 如东京都 -> 埼玉/神奈川/千叶/山梨
+
+// ===== 行政区（县/都道府县/州）=====
+// 只有选定了国家才有意义；日本会返回全部 47 个（含 0 节点的），这样"目标县当前没节点"
+// 也能被选中，交给后端做"同县 -> 就近 -> 全国"的降级。
+// ipt（IP 类型）必须带下去：选了"住宅"时，某县"可用 5/5"必须只算住宅节点 ——
+// 把机房也算进来，面板会显示"东京都还有货"，实际却只能降级，两边对不上。
+function loadRegions(co,ipt,cb){
+  if(!co){ if(cb)cb([]); return; }
+  if(typeof ipt!=='string'){ cb=ipt; ipt=''; }
+  ipt=ipt||'';
+  var ck=co+'|'+ipt;
+  if(_REG[ck]){ if(cb)cb(_REG[ck]); return; }
+  fetch('/api/regions?country='+encodeURIComponent(co)+'&ip_type='+encodeURIComponent(ipt))
+    .then(function(r){return r.json()})
+    .then(function(d){
+      _REG[ck]=(d&&d.regions)||[];
+      _REGCHAIN[co]=(d&&d.chains)||{};
+      if(cb)cb(_REG[ck]);
+    })
+    .catch(function(){ _REG[ck]=[]; if(cb)cb([]); });
+}
+// 固定递补顺序（目前只有日本东京都配了）："东京都 → 埼玉县 → 神奈川县 → 千叶县 → 山梨县"
+function regionChainText(co,key){
+  var m=_REGCHAIN[co]||{},arr=m[key];
+  return (arr&&arr.length>1)?arr.join(' → '):'';
+}
+function regionNameOf(co,key,ipt){
+  if(!key) return '';
+  var rows=_REG[co+'|'+(ipt||'')]||[];
+  for(var i=0;i<rows.length;i++) if(rows[i].key===key) return rows[i].name;
+  return key;
+}
+// 通道卡片里的县级下拉：国家变了要重新填，且不能因为面板每 3 秒重绘就闪一下
+var _rsSig={};        // {通道号: "国家|当前县"} 记住上次填过的组合，避免重复重建
+function fillRegionSel(i,sig){
+  var sel=document.getElementById('rs_'+i); if(!sel) return;
+  var cs=document.getElementById('cs_'+i);
+  var co=(cs&&cs.value)||(CH[i]&&CH[i].force_country)||'';
+  var cur=_saved['rs_'+i]||((CH[i]&&CH[i].force_region)||'');
+  var it=document.getElementById('ipt_'+i);
+  var ipt=(it&&it.value)||((CH[i]&&CH[i].force_ip_type)||'');
+  var want=co+'|'+cur+'|'+ipt;
+  if(!co){ sel.innerHTML='<option value="">不限县/州</option>'; sel.disabled=true; _rsSig[i]=''; return; }
+  sel.disabled=false;
+  if(sig!==true&&_rsSig[i]===want&&sel.options&&sel.options.length>1){ sel.value=cur; return; }
+  _rsSig[i]=want;
+  loadRegions(co,ipt,function(rows){
+    var h='<option value="">不限县/州</option>';
+    for(var k=0;k<rows.length;k++){
+      var r=rows[k];
+      var selAttr=(r.key===cur||r.name===cur)?' selected':'';
+      h+='<option value="'+esc(r.key)+'"'+selAttr+'>'+esc(r.name)+' · 可用 '+r.free+'/'+r.total+'</option>';
+    }
+    sel.innerHTML=h;
+    if(cur) sel.value=cur;
+  });
+}
+function onCtryPick(i){
+  var s=document.getElementById('cs_'+i); _saved['cs_'+i]=s?s.value:'';
+  _saved['rs_'+i]='';        // 换国家后旧县名多半不适用，清掉重新选
+  fillRegionSel(i,true);
+}
+
+// 点一下复制"代理地址 + 账号密码"。NAT 机上这串东西要填到客户端里，手抄容易错。
+function cpInfo(el){
+  var t=el&&el.dataset?el.dataset.info:'';
+  if(!t)return;
+  var done=function(){el.title='已复制：'+t};
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(done,function(){prompt('复制下面的连接信息',t)});
+  }else{prompt('复制下面的连接信息',t)}
+}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(m){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];});}
+
+// IP 类型：英文值一律只在内部用，界面上统一走这三个函数，
+// 免得又把 'residential' / 'unknown' 原样漏到页面上。
+function ipTypeLabel(t){
+  return t==='residential'?'住宅':t==='hosting'?'机房':t==='mobile'?'移动':
+         t==='unknown'?'未知':(t||'-');
+}
+function ipTypeCls(t){
+  return t==='residential'?'tp r':t==='hosting'?'tp h':t==='mobile'?'tp m':'tp u';
+}
+function confLabel(c){
+  return c==='high'?'置信度高':c==='medium'?'置信度中':c==='low'?'置信度低':'';
+}
+
+// 出口 IP 与其它通道重复时给个醒目提示（多出口场景下重复 = 白开一条通道）
+function dupTag(c,d){
+  if(c.ip_dup_with&&c.ip_dup_with.length){
+    return ' <span style="color:#f59e0b;font-size:10px" title="与 CH'+c.ip_dup_with.join(', CH')+' 出口相同">IP重复</span>';
+  }
+  if(c.ip_reused){
+    return ' <span style="color:#f59e0b;font-size:10px" title="该国未占用节点已用尽，复用了这条 IP">IP复用</span>';
+  }
+  return '';
+}
+
+function render(d){
+  // Preserve current dropdown selections
+  var _nCh=(d&&d.channels)?d.channels.length:9;
+  for(var i=0;i<_nCh;i++){
+    var el=document.getElementById('cs_'+i);if(el)_saved['cs_'+i]=el.value;
+    var el2=document.getElementById('ipt_'+i);if(el2)_saved['ipt_'+i]=el2.value;
+    var el3=document.getElementById('rs_'+i);if(el3)_saved['rs_'+i]=el3.value;
+  }
+  CH=d.channels; var g=document.getElementById('grid'),h='';
+  for(var i=0;i<CH.length;i++){
+    var c=CH[i];
+    var cls=c.state==='connected'?'card on':c.state==='connecting'?'card bz':c.state==='error'?'card fail':'card';
+    var dt=c.state==='connected'?'g':c.state==='connecting'?'y':c.state==='error'?'r':'g2';
+    var st={connected:'已连接',connecting:'连接中',disconnected:'未连接',error:'错误'}[c.state]||c.state;
+    var it=ipTypeLabel(c.node_ip_type);
+    var ipc=ipTypeCls(c.node_ip_type);
+    h+='<div class="'+cls+'"><div class="chf"><div class="ct"><span class="cn">CH'+c.index+'</span><span class="dt '+dt+'"></span>'+st+'</div><span style="font-size:10px;color:#6b7280">'+c.tun+'</span></div>';
+    h+='<div class="bd"><div class="i"><span class="ll">出口IP</span><span>'+ (c.node_ip||'-') +'</span>'+ dupTag(c,d) +'</div>';
+    var ctryShown=c.node_country||c.force_country||'';
+    h+='<div class="i"><span class="ll">国家</span><span'+(c.node_country?'':' style="color:#6b7280"')+'>'+ (ctryShown||'-') +'</span></div>';
+    // 县/都道府县：已连接显示节点实际所在县；还没连上时显示"目标县"。
+    // region_lock 是后端记下的"降级后实际锁定的县"——和 force_region 不同就标"已锁定"，
+    // 让用户知道这条通道不会再因为东京都恢复可用而切回去。
+    var regShown=c.node_region||'';
+    var regWant=c.force_region?(c.force_region_name||regionNameOf(c.force_country, c.force_region, c.force_ip_type)):'';
+    var regLock=c.region_lock?(c.region_lock_name||regionNameOf(c.force_country, c.region_lock, c.force_ip_type)):'';
+    var regLocked=!!(regLock&&c.force_region&&regLock!==regWant&&c.region_lock!==c.force_region);
+    if(regShown||regWant){
+      var regTxt=regShown||('<span style="color:#6b7280">目标 '+esc(regWant||c.force_region)+'</span>');
+      var regCls=(regWant&&regShown&&regShown!==regWant)?' style="color:#f59e0b"':'';
+      var regTip=regWant?('目标：'+regWant):'';
+      if(regLocked){
+        regTxt+='<span style="font-size:10px;color:#f59e0b"> · 已锁定</span>';
+        regTip+='；已按固定顺序退到 '+regLock+'，'+regWant+'恢复可用后也不会切回';
+      }
+      h+='<div class="i"><span class="ll">县/州</span><span class="ow"'+regCls+' title="'+esc(regTip)+'">'+ regTxt +'</span></div>';
+    }
+    h+='<div class="i"><span class="ll">位置</span><span style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+ (c.node_location||'-') +'</span></div>';
+    h+='<div class="i"><span class="ll">运营主体</span><span class="ow" title="'+c.node_owner+'">'+ (c.node_owner||'-') +'</span></div>';
+    h+='<div class="i"><span class="ll">IP类型</span><span'+(ipc?' class="'+ipc+'"':'')+'>'+ (it||'-') +'</span></div>';
+    if(c.node_ip_reason){
+      var cf=confLabel(c.node_ip_confidence);
+      h+='<div class="i"><span class="ll">判定依据</span><span class="ow" title="'+String(c.node_ip_reason).replace(/["<>]/g,'')+'">'+c.node_ip_reason+(cf?' · '+cf:'')+'</span></div>';
+    }
+    h+='<div class="i"><span class="ll">延迟</span><span>'+ (c.node_latency>0?c.node_latency+'ms':'-') +'</span></div>';
+    if(c.speed_testing){
+      h+='<div class="i"><span class="ll">实测带宽</span><span style="color:#818cf8">测速中...</span></div>';
+    }else if(c.speed_mbps>0){
+      h+='<div class="i"><span class="ll">实测带宽</span><span class="mbp'+(c.speed_mbps>=10?' g':'')+'" title="TTFB '+c.speed_ttfb_ms+'ms · '+fmtAge(Math.round((Date.now()/1000)-(c.speed_at||0)))+'">'+c.speed_mbps.toFixed(2)+' Mbps</span></div>';
+    }else if(c.speed_error){
+      h+='<div class="i"><span class="ll">实测带宽</span><span style="color:#ef4444;font-size:11px" title="'+esc(c.speed_error)+'">测速失败</span></div>';
+    }
+    if(c.proxy_error){
+      // 本地代理端口没起来：隧道就算通了也没法通过它访问，必须显式标出来，
+      // 否则面板看着一切正常、实际这条通道用不了
+      h+='<div class="i"><span class="ll">代理</span><span style="color:#ef4444;font-size:11px" title="'+esc(c.proxy_error)+'">端口 '+c.proxy_port+' 未监听</span></div>';
+    }else{
+      h+='<div class="i"><span class="ll">代理</span><span>:'+c.proxy_port+'</span></div>';
+    }
+    if(c.error) h+='<div class="i"><span class="ll">错误</span><span style="color:#ef4444">'+c.error+'</span></div>';
+    h+='<label class="tog" title="关掉后该通道不再自动重连（等于手动断开）"><input type="checkbox" id="tog_'+c.index+'"'+(c.enabled?' checked':'')+' onchange="toggleChannel('+c.index+')">守护自动重连</label>';
+    h+='</div><div class="ac"><select id="cs_'+c.index+'"'+(c.state==='connecting'?' disabled':'')+' onchange="onCtryPick('+c.index+')">';
+    h+='<option value="">自动选择</option>';
+    if(d.countries) for(var j=0;j<d.countries.length;j++){
+      var co=d.countries[j];
+      var sel=(_saved['cs_'+c.index]===co)||(c.force_country===co)?' selected':'';
+      var st=(d.country_stats&&d.country_stats[co])||null;
+      var lb=co+(st?(' · 剩'+Math.max(0,st.total-st.used)+'/'+st.total):'');  // 该国还剩几个可用节点
+      h+='<option value="'+co+'"'+sel+'>'+lb+'</option>';
+    }
+    h+='</select>';
+    // 县级下拉：只在选了国家之后才有意义；该县没可用节点时后端会自动就近降级，
+    // 所以这里不做"没节点就禁用"，否则用户永远触发不了降级。
+    h+='<select id="rs_'+c.index+'" title="精确到县/都道府县：该县没有可用节点时自动就近降级"'+(c.state==='connecting'?' disabled':'')+' style="flex:0 0 auto;max-width:118px">';
+    h+='<option value="">不限县/州</option></select>';
+    var savedIpt=_saved['ipt_'+c.index]||'';
+    h+='<select id="ipt_'+c.index+'" title="指定后就严格按这个类型挑；住宅模式下机房 IP 不参与，该县没有住宅节点就直接往就近的县降级"'+(c.state==='connecting'?' disabled':'')+' onchange="fillRegionSel('+c.index+',true)">';
+    h+='<option value="">全部IP</option><option value="residential"'+(savedIpt==='residential'||c.force_ip_type==='residential'?' selected':'')+'>住宅</option>';
+    h+='<option value="hosting"'+(savedIpt==='hosting'||c.force_ip_type==='hosting'?' selected':'')+'>机房</option>';
+    h+='<option value="mobile"'+(savedIpt==='mobile'||c.force_ip_type==='mobile'?' selected':'')+'>移动</option>';
+    h+='<option value="unknown"'+(savedIpt==='unknown'||c.force_ip_type==='unknown'?' selected':'')+'>未知</option></select>';
+    h+='<button class="btn" onclick="connectAuto('+c.index+')"'+(c.state==='connecting'||c.state==='connected'?' disabled':'')+'>连接</button>';
+    h+='<button class="btn" onclick="chSpeed('+c.index+')"'+(c.state==='connected'&&!c.speed_testing?'':' disabled')+'>'+(c.speed_testing?'测速中':'测速')+'</button>';
+    h+='<button class="btn d" onclick="dc('+c.index+')"'+(c.state!=='connected'||c.speed_testing?' disabled':'')+'>断开</button>';
+    h+='</div></div>';
+  }
+  g.innerHTML=h;
+  for(var i=0;i<CH.length;i++) fillRegionSel(i);   // 国家已定但县列表是异步拉的
+  var ncEl=document.getElementById('nc');
+  if(ncEl){
+    ncEl.textContent='节点: '+(d.node_count||0)
+      +(d.new_node_count>0?(' · 新 '+d.new_node_count):'')
+      +(d.nodes_source==='snapshot'?' · 用的是本地快照':'');
+    ncEl.style.color=(d.nodes_source==='snapshot')?'#f59e0b':'';   // 回退到快照时给个显眼提示
+  }
+  _CS=d.country_stats||{}; _CST=d.country_stats_by_type||{}; _CTRY=d.countries||[];
+  updateJobs(d);
+  var am=document.getElementById('assignModal');
+  if(am&&am.classList.contains('show')&&asMode()==='same'){fillCtryOptions();asCtryHint();}
+  var ocEl=document.getElementById('oc');
+  if(ocEl&&d.outlets){
+    var nUsed=Object.keys(d.outlets).length;
+    ocEl.textContent='出口 '+nUsed+'/'+CH.length;
+    ocEl.style.color=(nUsed<CH.length)?'#6b7280':'#22c55e';
+  }
+}
+async function rf(){try{var r=await fetch('/api/status');if(r.status===401){location.href='/';return}var d=await r.json();if(d.username)CUR_USER=d.username;render(d)}catch(e){}}
+async function toggleChannel(i){
+  var el=document.getElementById('tog_'+i);
+  await fetch('/api/channel/'+i+'/toggle?enabled='+(el.checked?'1':'0'),{method:'POST'});
+  if(!el.checked) dc(i);
+}
+async function connectAuto(i){
+  var s=document.getElementById('cs_'+i);var c=s?s.value:'';
+  var t=document.getElementById('ipt_'+i);var ip=t?t.value:'';
+  var rg=document.getElementById('rs_'+i);var reg=rg?rg.value:'';
+  await fetch('/api/channel/'+i+'/connect?country='+encodeURIComponent(c)
+    +'&region='+encodeURIComponent(reg)+'&ip_type='+encodeURIComponent(ip),{method:'POST'});
+  setTimeout(rf,500)}
+async function fetchNodes(){
+  document.getElementById('rc').textContent='获取中...';
+  try{
+    var r=await fetch('/api/fetch_nodes',{method:'POST'});
+    var d=await r.json();
+    if(d.ok){
+      var msg='获取完成: '+d.total+' 节点';
+      if(d.baseline) msg+=', 已建立基线';
+      if(d.new>0) msg+=', 新增 '+d.new;
+      if(d.dup>0) msg+=', 重复 '+d.dup;
+      if(d.source==='snapshot') msg+=' ⚠ 在线源不可用，用的是本地快照';
+      document.getElementById('rc').textContent=msg;
+    }
+  }catch(e){}
+  setTimeout(refreshNodes,3000);}
+async function dc(i){await fetch('/api/channel/'+i+'/disconnect',{method:'POST'});rf()}
+rf();setInterval(rf,3000);
+
+function openSwitch(node_id,node_ip,node_country){
+  CUR_NODE=node_id;
+  document.getElementById('m_node_info').textContent=node_ip+' ('+node_country+')';
+  var sel=document.getElementById('m_ch'); sel.innerHTML='';
+  for(var i=0;i<CH.length;i++){
+    var opt=document.createElement('option'); opt.value=i;
+    opt.textContent='CH'+i+' ('+CH[i].tun+')'+(CH[i].state==='connected'?' - '+CH[i].node_ip:' - 未连接');
+    sel.appendChild(opt);
+  }
+  // 单通道时只有一个可选目标，这个下拉没有选择意义，直接藏起来
+  sel.style.display=(CH.length>1)?'':'none';
+  document.getElementById('modal').classList.add('show');
+}
+async function switchNode(){
+  var idx=document.getElementById('m_ch').value;
+  await fetch('/api/channel/'+idx+'/connect?node_id='+encodeURIComponent(CUR_NODE),{method:'POST'});
+  closeModal(); setTimeout(rf,500);
+}
+function closeModal(){document.getElementById('modal').classList.remove('show');CUR_NODE=null}
+
+// ===== 节点仓：新节点标记 / 延迟测试 / 带宽测速 =====
+var CK={};          // 勾选的节点 id
+var _wasRunning=false;
+
+function fmtAge(s){
+  if(s===null||s===undefined||s<0) return '-';
+  if(s<60) return s+' 秒前';
+  if(s<3600) return Math.floor(s/60)+' 分钟前';
+  if(s<86400) return Math.floor(s/3600)+' 小时前';
+  return Math.floor(s/86400)+' 天前';
+}
+function fmtBps(bps){          // VPNGate 官方 Speed 字段单位是 bps
+  if(!bps||bps<=0) return '-';
+  var m=Number(bps)/1e6;
+  if(m>=1000) return (m/1000).toFixed(2)+' Gbps';
+  if(m>=1) return m.toFixed(1)+' Mbps';
+  return (m*1000).toFixed(0)+' Kbps';
+}
+function ckNode(el){
+  var id=el.getAttribute('data-nid');
+  if(el.checked) CK[id]=1; else delete CK[id];
+}
+function toggleAllNodes(on){
+  var boxes=document.querySelectorAll('#tb .cb');
+  for(var i=0;i<boxes.length;i++){
+    boxes[i].checked=on;
+    var id=boxes[i].getAttribute('data-nid');
+    if(on) CK[id]=1; else delete CK[id];
+  }
+}
+function checkedIds(){
+  var out=[]; for(var k in CK) if(CK[k]) out.push(k); return out;
+}
+
+async function refreshNodes(){
+  var st=document.getElementById('f_status').value;
+  var ct=document.getElementById('f_country').value;
+  var rg=document.getElementById('f_region');
+  var rv=rg?rg.value:'';
+  var tp=document.getElementById('f_type').value;
+  var so=document.getElementById('f_sort').value;
+  var q='?filter='+st+'&country='+encodeURIComponent(ct)+'&region='+encodeURIComponent(rv)
+       +'&ip_type='+encodeURIComponent(tp)+'&sort='+so;
+  try{
+    var r=await fetch('/api/nodes'+q); var d=await r.json();
+    var tb=document.getElementById('tb'),h='';
+    for(var i=0;i<d.nodes.length;i++){
+      var n=d.nodes[i];
+      var av=n.available?'sta ok':'sta no';
+      var avt=n.available?'可用':'不可用';
+      var ipc=ipTypeCls(n.ip_type);
+      var newTag=n.is_new?(' <span class="bnw" title="首现于 '+fmtAge(n.new_age_s)+'">新</span>'):'';
+      h+='<tr class="'+(n.is_new?'isnew':'')+'">';
+      h+='<td><input type="checkbox" class="cb" data-nid="'+esc(n.id)+'"'+(CK[n.id]?' checked':'')+' onchange="ckNode(this)"></td>';
+      h+='<td><span class="sta '+av+'">'+avt+'</span></td>';
+      h+='<td>'+newTag+n.ip+':'+n.port+'</td>';
+      h+='<td class="ow" title="'+esc(n.location)+'">'+(n.location||'-')+'</td>';
+      h+='<td class="ow" title="'+(n.region?(esc(n.region)+(n.region_zone?'（'+esc(n.region_zone)+'）':'')):'未识别')+'">'+(n.region?esc(n.region):'<span style="color:#4b5563">-</span>')+'</td>';
+      h+='<td class="ow" title="'+esc(n.owner)+'">'+(n.owner||'-')+'</td>';
+      var tip=(n.ip_reason||'')+(confLabel(n.ip_confidence)?' · '+confLabel(n.ip_confidence):'')+(n.is_vpn_exit?' / VPN出口IP':'');
+      tip=String(tip).replace(/["<>]/g,'');
+      h+='<td>'+(n.ip_type?'<span class="'+ipc+'" title="'+tip+'">'+ipTypeLabel(n.ip_type)+'</span>':'-')+'</td>';
+      // 实测延迟：测过但不通给红色"不通"，没测过是灰色 "-"
+      if(n.tcp_latency>0) h+='<td>'+n.tcp_latency+' ms</td>';
+      else if(n.tcp_latency_at) h+='<td><span style="color:#ef4444">不通</span></td>';
+      else h+='<td><span style="color:#4b5563">-</span></td>';
+      h+='<td>'+(n.speed>0?fmtBps(n.speed):'<span style="color:#4b5563">-</span>')+'</td>';
+      // 实测带宽（真实建隧道跑出来的）
+      if(n.test_out_at&&n.test_out_mbps>0) h+='<td><span class="mbp'+(n.test_out_mbps>=10?' g':'')+'">'+n.test_out_mbps.toFixed(2)+' Mbps</span></td>';
+      else if(n.test_out_at&&n.test_out_error) h+='<td><span style="color:#ef4444;font-size:10px" title="'+esc(n.test_out_error)+'">失败</span></td>';
+      else h+='<td><span style="color:#4b5563">未测</span></td>';
+      h+='<td>'+(n.first_seen?'<span style="color:'+(n.is_new?'#22c55e':'#6b7280')+'" title="'+new Date(n.first_seen*1000).toLocaleString()+'">'+fmtAge(n.new_age_s)+'</span>':'-')+'</td>';
+      h+='<td class="act-cell">';
+      if(n.available) h+='<button class="btn" onclick="openSwitch(\''+n.id+'\',\''+n.ip+':'+n.port+'\',\''+(n.country_long||'')+'\')">切换</button>';
+      else h+='<button class="btn" disabled>切换</button>';
+      h+='</td></tr>';
+    }
+    tb.innerHTML=h;
+    var extra='';
+    if(d.nodes.length) extra=' · 新 '+d.nodes.filter(function(x){return x.is_new}).length;
+    document.getElementById('rc').textContent='共 '+d.total+' 个节点 (显示 '+d.nodes.length+')'+extra;
+  }catch(e){}
+}
+
+async function doPost(url){
+  try{ var r=await fetch(url,{method:'POST'}); var d=await r.json(); return d; }catch(e){ return {ok:false,error:String(e)} }
+}
+async function nodePing(){
+  var ids=checkedIds();
+  var q=ids.length?('?ids='+encodeURIComponent(ids.join(','))):'';
+  var d=await doPost('/api/nodes/ping'+q);
+  if(!d.ok) alert(d.error||'启动失败'); else document.getElementById('job').style.display='';
+}
+async function nodeSpeed(){
+  var ids=checkedIds();
+  var q=ids.length?('?ids='+encodeURIComponent(ids.join(','))):'';
+  var tip=ids.length?('将通过测速专用口，依次为勾选的 '+ids.length+' 个节点实测带宽，'
+                     +'每个约 15~30 秒。正式出口的隧道和端口都不受影响。'):
+                    '未勾选任何节点，将实测「新节点」（最多 20 个）。将通过测速专用口，'
+                     +'每个节点约 15~30 秒。正式出口的隧道和端口都不受影响。';
+  if(!confirm(tip+'\n\n继续？')) return;
+  var d=await doPost('/api/nodes/speedtest'+q);
+  if(!d.ok) alert(d.error||'启动失败'); else document.getElementById('job').style.display='';
+}
+async function stopSpeed(){
+  var d=await doPost('/api/nodes/speedtest_stop');
+  if(!d.ok) alert(d.error||'停止失败');
+}
+async function clearNew(){
+  var d=await doPost('/api/nodes/clear_new');
+  if(d.ok){ refreshNodes(); } else alert(d.error||'失败');
+}
+async function chSpeed(i){
+  var d=await doPost('/api/channel/'+i+'/speedtest');
+  if(!d.ok) alert(d.error||'启动失败');
+}
+async function chSpeedAll(){
+  var d=await doPost('/api/channels/speedtest');
+  if(!d.ok) alert(d.error||'启动失败');
+}
+function updateJobs(d){
+  var job=document.getElementById('job');
+  var txt=document.getElementById('job_txt');
+  var bar=document.getElementById('job_bar');
+  var btnStop=document.getElementById('btnStop');
+  var btnSpeed=document.getElementById('btnSpeed');
+  var btnPing=document.getElementById('btnPing');
+  if(!job) return;
+  var pt=d.ping_task||{}, st=d.speed_task||{};
+  var running=!!(pt.running||st.running);
+  var lines=[], pct=0;
+  if(pt.running){
+    pct=pt.total?(pt.done/pt.total*100):0;
+    lines.push('延迟测试 '+pt.done+'/'+pt.total+'（通 '+pt.ok+' · 不通 '+pt.fail+'）');
+  }
+  if(st.running){
+    pct=st.total?(st.done/st.total*100):0;
+    lines.push('带宽测速 '+st.done+'/'+st.total+(st.current_ip?(' · 当前 '+st.current_ip):''));
+  }
+  btnStop.style.display=st.running?'':'none';
+  btnSpeed.disabled=running; btnPing.disabled=running;
+  if(running){
+    _wasRunning=true;
+    job.style.display=''; txt.textContent=lines.join('    |    '); bar.style.width=pct+'%';
+  }else if(_wasRunning){
+    _wasRunning=false;
+    job.style.display=''; txt.textContent='任务已完成，正在刷新结果...'; bar.style.width='100%';
+    setTimeout(function(){ if(!_wasRunning){ job.style.display='none'; bar.style.width='0'; } },4000);
+    refreshNodes();
+  }else{
+    job.style.display='none';
+  }
+}
+async function loadCountries(){
+  try{
+    var r=await fetch('/api/status'); var d=await r.json();
+    var sel=document.getElementById('f_country');
+    if(d.countries) for(var i=0;i<d.countries.length;i++){var o=document.createElement('option');o.value=d.countries[i];o.textContent=d.countries[i];sel.appendChild(o)}
+  }catch(e){}
+}
+// 国家筛选变化时，把"县/州"下拉换成该国可选的行政区（日本含全部 47 个）
+function loadRegionFilter(){
+  var co=document.getElementById('f_country').value;
+  var fty=document.getElementById('f_type');
+  var ipt=(fty&&fty.value)||'';
+  var sel=document.getElementById('f_region'); if(!sel) return;
+  var cur=sel.value;
+  if(!co){ sel.innerHTML='<option value="">所有县/州</option>'; return; }
+  sel.innerHTML='<option value="">所有县/州</option>';
+  loadRegions(co,ipt,function(rows){
+    var h='<option value="">所有县/州</option>';
+    for(var i=0;i<rows.length;i++){
+      var r=rows[i];
+      h+='<option value="'+esc(r.key)+'">'+esc(r.name)+(r.total?('（可用 '+r.free+'/'+r.total+'）'):'（当前无节点）')+'</option>';
+    }
+    sel.innerHTML=h;
+    if(cur) sel.value=cur;
+  });
+}
+['f_status','f_type','f_sort'].forEach(function(id){
+  var el=document.getElementById(id);
+  if(el) el.addEventListener('change',refreshNodes);
+});
+// 改 IP 类型时，"县/州"下拉里的可用数也要跟着只算这一类，否则和列表里的结果对不上
+var _ft=document.getElementById('f_type');
+if(_ft) _ft.addEventListener('change',loadRegionFilter);
+var fc=document.getElementById('f_country');
+if(fc) fc.addEventListener('change',function(){loadRegionFilter();refreshNodes();});
+var fr=document.getElementById('f_region');
+if(fr) fr.addEventListener('change',refreshNodes);
+loadCountries(); refreshNodes();
+</script>
+
+<div class="modal" id="adminModal"><div class="modal-c">
+  <h3>修改管理账号 / 密码</h3>
+  <div class="fg" style="margin-bottom:12px"><label>当前账号</label><input type="text" id="a_user" autocomplete="username" style="width:100%;padding:8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:13px;outline:none"></div>
+  <div class="fg" style="margin-bottom:12px"><label>当前密码</label><input type="password" id="a_pass" autocomplete="current-password" style="width:100%;padding:8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:13px;outline:none"></div>
+  <div style="height:1px;background:rgba(255,255,255,0.08);margin:14px 0"></div>
+  <div class="fg" style="margin-bottom:12px"><label>新账号 <span style="color:#6b7280">（留空则不修改）</span></label><input type="text" id="a_newuser" autocomplete="off" placeholder="3~32 位，字母/数字/_.-" style="width:100%;padding:8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:13px;outline:none"></div>
+  <div class="fg" style="margin-bottom:12px"><label>新密码 <span style="color:#6b7280">（留空则只改账号）</span></label><input type="password" id="a_newpass" autocomplete="new-password" placeholder="至少 8 位" style="width:100%;padding:8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:13px;outline:none"></div>
+  <div class="fg" style="margin-bottom:12px"><label>确认新密码</label><input type="password" id="a_newpass2" autocomplete="new-password" style="width:100%;padding:8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:13px;outline:none"></div>
+  <div style="color:#6b7280;font-size:11px;line-height:1.6">修改成功后所有登录状态会立即失效，需要用新账号密码重新登录；守护脚本使用独立令牌，不受影响。</div>
+  <div class="btns" style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+    <button class="btn" id="a_submit" onclick="changePwd()">确认修改</button>
+    <button class="btn" style="background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);color:#e0e0e0" onclick="logout()">退出登录</button>
+    <button class="btn d" onclick="document.getElementById('adminModal').classList.remove('show')">取消</button>
+  </div>
+  <div id="a_msg" style="color:#22c55e;font-size:12px;margin-top:8px;display:none"></div>
+</div></div>
+
+<div class="modal" id="assignModal"><div class="modal-c" style="max-width:760px">
+  <h3>选择出口</h3>
+  <div style="color:#6b7280;font-size:11px;line-height:1.7;margin-bottom:12px">
+    VPNGate 是志愿者网络，节点随时上下线。选好国家/地区和 IP 类型后，
+    面板会挑一个最合适的节点、建好隧道并连上；换一次出口就是换一次 IP。
+  </div>
+  <!-- 单通道版：只有一条通道，"分几个国家 / 分配到前几条"这些多通道概念没有意义，
+       统一只走"指定国家+县"这一路（mode=same），选项本身保留但不再暴露给用户。 -->
+  <div style="display:none;flex-direction:column;gap:8px;margin-bottom:10px;font-size:12px">
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="radio" name="as_mode" value="country" onchange="asModeUI();previewAssign()">
+      尽量分到不同国家/地区
+    </label>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="radio" name="as_mode" value="same" checked onchange="asModeUI();previewAssign()">
+      全部通道用同一个国家/地区
+    </label>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+      <input type="radio" name="as_mode" value="ip" onchange="asModeUI();previewAssign()">
+      不限国家，只保证出口 IP 互不重复
+    </label>
+  </div>
+  <div id="as_ctry_row" style="display:none;flex-direction:column;gap:6px;margin-bottom:10px">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span style="font-size:12px;color:#9ca3af">固定国家/地区</span>
+      <select id="as_ctry" onchange="fillAsRegions(true);asCtryHint();previewAssign()" style="min-width:230px;padding:6px 8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:12px;outline:none"></select>
+      <span id="as_ctry_hint" style="font-size:11px;color:#6b7280"></span>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span style="font-size:12px;color:#9ca3af">精确到县/州</span>
+      <select id="as_region" onchange="asRegionHint();previewAssign()" style="min-width:230px;padding:6px 8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:12px;outline:none"></select>
+      <span id="as_region_hint" style="font-size:11px;color:#6b7280"></span>
+    </div>
+    <div style="font-size:11px;color:#6b7280;line-height:1.6">
+      选定县/州后优先落在该县；该县可用节点不够时，按
+      <span style="color:#9ca3af">同大区 → 全国由近到远</span> 自动就近降级，并在下方列出实际落点。
+      日本可选全部 47 个都道府县（当前没有节点的也能选，选了就会就近递补）。
+    </div>
+    <label style="display:none;align-items:center;gap:8px;cursor:pointer;font-size:11px;color:#9ca3af">
+      <input type="checkbox" id="as_fill" onchange="previewAssign()">
+      该国节点不够时，用其它国家/地区补满
+    </label>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+    <span style="font-size:12px;color:#9ca3af">出口 IP 类型</span>
+    <select id="as_ipt" onchange="fillCtryOptions();fillAsRegions(true);asCtryHint();previewAssign()" title="指定后就严格按这个类型分配：选了住宅，某县只剩机房节点也当作没货，直接往就近的县降级" style="padding:6px 8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:12px;outline:none">
+      <option value="">不限</option><option value="residential">住宅</option><option value="hosting">机房</option><option value="mobile">移动</option><option value="unknown">未知</option>
+    </select>
+    <span style="display:none;font-size:12px;color:#9ca3af">分配通道数</span>
+    <select id="as_count" style="display:none;padding:6px 8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:12px;outline:none">
+      <option value="">全部</option>
+    </select>
+    <button class="btn" style="background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);color:#e0e0e0" onclick="previewAssign()">重新规划</button>
+  </div>
+  <div id="as_body" style="max-height:42vh;overflow:auto"></div>
+  <div class="btns" style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
+    <button class="btn" id="as_apply" onclick="applyAssign()">应用并连接</button>
+    <button class="btn d" onclick="document.getElementById('assignModal').classList.remove('show')">取消</button>
+  </div>
+  <div id="as_msg" style="font-size:12px;margin-top:8px;display:none"></div>
+</div></div>
+
+<script>
+var _assignPlan=null;
+function needCount(){   // 本次要分配到几条通道（单通道版就是 1 条）
+  var v=document.getElementById('as_count').value;
+  if(v)return parseInt(v,10);
+  return (CH&&CH.length)?CH.length:1;
+}
+function freeOf(co,ipt){    // 该国还剩几个没被占用的节点；ipt 非空时只算这一类
+  var map=(ipt&&_CST[ipt])||_CS;
+  var st=map[co];return st?Math.max(0,(st.total||0)-(st.used||0)):0;
+}
+function ctryStat(co,ipt){return ((ipt&&_CST[ipt])||_CS)[co]||null}
+function fillCtryOptions(){   // 用 /api/status 的国家供给填"固定国家"下拉，够用的排前面
+  var sel=document.getElementById('as_ctry');if(!sel)return;
+  var cur=sel.value,ipt=asIpt();
+  var arr=(_CTRY||[]).slice();
+  // 选了「住宅」就按住宅口径排序/显示：不然会出现"日本可用 40 个"而实际只有 11 个住宅
+  arr.sort(function(a,b){return freeOf(b,ipt)-freeOf(a,ipt)});
+  var h='';
+  for(var i=0;i<arr.length;i++){
+    var co=arr[i],st=ctryStat(co,ipt);
+    h+='<option value="'+esc(co)+'">'+esc(co)+(st?(' · 可用 '+freeOf(co,ipt)+'/'+st.total):'')+'</option>';
+  }
+  sel.innerHTML=h;
+  if(cur&&arr.indexOf(cur)>=0)sel.value=cur;   // 保留用户已选
+  else if(arr.length)sel.value=arr[0];         // 否则默认选可用最多的那个（别依赖浏览器隐式选中）
+}
+function asCtryHint(){
+  var sel=document.getElementById('as_ctry'),el=document.getElementById('as_ctry_hint');
+  if(!sel||!el)return;
+  var co=sel.value,need=needCount(),ipt=asIpt(),st=ctryStat(co,ipt);
+  if(!co||!st){el.textContent='';return}
+  var fr=freeOf(co,ipt),tl=ipTypeLabel(ipt);
+  el.innerHTML='可用 <b style="color:'+(fr>=need?'#22c55e':'#f59e0b')+'">'+fr+'</b> 个'
+    +(tl?tl+'节点':'')+'，本次需要 '+need+' 条'
+    +(tl?('<div style="margin-top:2px;color:#6b7280">只算'+tl+' IP，机房等其它类型不参与</div>'):'');
+}
+// "精确到县"下拉：跟着国家走。日本含全部 47 个（0 节点的也列出来，选了就走就近降级）
+var _asRegCo='';      // 上次填充时用的国家，避免每次预览都重建下拉把用户选择冲掉
+var _asRegIpt='';     // 上次填充时用的 IP 类型（选了"住宅"就只统计住宅节点）
+var _asRegPick='';    // 用户当前选中的县（国家变了要清空）
+function asIpt(){var el=document.getElementById('as_ipt');return el?el.value:''}
+function fillAsRegions(force){
+  var cs=document.getElementById('as_ctry'),sel=document.getElementById('as_region');
+  if(!cs||!sel)return;
+  var co=cs.value,ipt=asIpt();
+  if(!co){sel.innerHTML='<option value="">不限县/州（全国任意）</option>';sel.disabled=true;_asRegCo='';_asRegIpt='';return}
+  sel.disabled=false;
+  if(!force&&_asRegCo===co&&_asRegIpt===ipt&&sel.options&&sel.options.length>1)return;
+  var cur=_asRegPick;
+  if(_asRegCo!==co) cur='';            // 换国家了，之前选的县不适用
+  _asRegCo=co;_asRegIpt=ipt;
+  sel.innerHTML='<option value="">不限县/州（全国任意）</option>';
+  loadRegions(co,ipt,function(rows){
+    var h='<option value="">不限县/州（全国任意）</option>';
+    for(var i=0;i<rows.length;i++){
+      var r=rows[i];
+      h+='<option value="'+esc(r.key)+'"'+(r.key===cur?' selected':'')+'>'+esc(r.name)
+        +(r.zone?'（'+esc(r.zone)+'）':'')+' · 可用 '+r.free+'/'+r.total+'</option>';
+    }
+    sel.innerHTML=h;
+    if(cur)sel.value=cur;
+    asRegionHint();
+  });
+}
+function asRegionHint(){
+  var cs=document.getElementById('as_ctry'),rs=document.getElementById('as_region'),
+      el=document.getElementById('as_region_hint');
+  if(!cs||!rs||!el)return;
+  var co=cs.value,key=rs.value,need=needCount(),ipt=asIpt();
+  _asRegPick=key;
+  if(!co||!key){el.textContent='';return}
+  var rows=_REG[co+'|'+ipt]||[],row=null;
+  for(var i=0;i<rows.length;i++)if(rows[i].key===key)row=rows[i];
+  if(!row){el.textContent='';return}
+  var chain=regionChainText(co,key),tl=ipTypeLabel(ipt);
+  var unit=tl?tl+'节点':'节点';
+  // 机型限制只有"屋顶"这一层：该县没有住宅节点就立刻递降，不会退而求其次用机房
+  var extra=tl?('，只算'+tl+' IP（机房不参与降级）'):'';
+  el.innerHTML='该县可用 <b style="color:'+(row.free>=need?'#22c55e':'#f59e0b')+'">'+row.free
+    +'</b> 个'+unit+extra+(row.free>=need?'':('，不够 '+need+' 条：降级前会先重扫本县，确实没有才递补'))
+    +(chain?('<div style="margin-top:2px;color:#6b7280">固定顺序：'+esc(chain)+' → 其它地区由近到远</div>'):'');
+}
+function asModeUI(){
+  var m=asMode();
+  document.getElementById('as_ctry_row').style.display=(m==='same')?'flex':'none';
+  if(m==='same'){fillCtryOptions();fillAsRegions();asCtryHint();}
+}
+function showAssign(){
+  document.getElementById('assignModal').classList.add('show');
+  var m=document.getElementById('as_msg');m.style.display='none';
+  var start=function(){asModeUI();previewAssign()};
+  if(_CTRY&&_CTRY.length){start();return}
+  fetch('/api/status').then(function(r){return r.ok?r.json():null}).then(function(d){
+    if(d&&d.country_stats){_CS=d.country_stats;_CST=d.country_stats_by_type||{};_CTRY=d.countries||[]}
+    start();
+  }).catch(function(){start()});
+}
+function asMode(){
+  var r=document.querySelector('input[name="as_mode"]:checked');
+  return r?r.value:'country';
+}
+function asQ(){
+  var same=asMode()==='same';
+  var cs=document.getElementById('as_ctry');
+  var rs=document.getElementById('as_region');
+  var fl=document.getElementById('as_fill');
+  return 'mode='+asMode()+'&ip_type='+encodeURIComponent(document.getElementById('as_ipt').value)
+       +'&count='+encodeURIComponent(document.getElementById('as_count').value)
+       +'&country='+encodeURIComponent(same&&cs?cs.value:'')
+       +'&region='+encodeURIComponent(same&&rs?rs.value:'')
+       +'&fill='+((same&&fl&&fl.checked)?'1':'0');
+}
+function asMsgA(t,ok){
+  var m=document.getElementById('as_msg');m.style.display='block';
+  m.style.color=ok?'#22c55e':'#ef4444';m.textContent=t;
+}
+async function previewAssign(){
+  var body=document.getElementById('as_body');
+  if(asMode()==='same'){fillCtryOptions();fillAsRegions();asCtryHint();}
+  body.innerHTML='<div style="color:#6b7280;font-size:12px">正在规划...</div>';
+  try{
+    var r=await fetch('/api/channels/auto_assign?dry_run=1&'+asQ(),{method:'POST'});
+    if(r.status===401){location.href='/';return}
+    var d=await r.json();
+    if(!d.ok||!d.plan||!d.plan.length){
+      body.innerHTML='<div style="color:#ef4444;font-size:12px">'+esc(d.error||'规划失败')+'</div>';return;
+    }
+    _assignPlan=d.plan;
+    var wantRegion=(document.getElementById('as_region')||{}).value||'';
+    var h='<table style="width:100%;border-collapse:collapse;font-size:12px">';
+    h+='<thead><tr style="color:#6b7280;text-align:left"><th style="padding:6px 4px">出口</th><th>国家/地区</th><th>县/州</th><th>出口 IP</th><th>运营主体</th><th>该国节点</th></tr></thead><tbody>';
+    var cnt={},rcnt={},near=0;
+    for(var i=0;i<d.plan.length;i++){
+      var p=d.plan[i];cnt[p.country]=(cnt[p.country]||0)+1;
+      // 县一列：命中目标县绿色；降级到别处标黄并给出距离，让用户一眼看出"没拿到东京都"。
+      // 没指定目标县时（region_tier=-1）只平铺显示，不要整列都标黄。
+      var rcell='-';
+      if(p.region){
+        if(!wantRegion||p.region_tier===0){
+          rcell=wantRegion?('<span style="color:#22c55e">'+esc(p.region)+'</span>'):esc(p.region);
+        }else{
+          near++;
+          rcnt[p.region]=(rcnt[p.region]||0)+1;
+          var dtxt=(p.distance_km!==null&&p.distance_km!==undefined)?('约 '+Math.round(p.distance_km)+'km'):'就近';
+          // 落在固定顺序上的（第 2/3… 顺位）额外标出来：说明这是"按你指定的次序"退的，
+          // 而不是单纯按直线距离随便挑的
+          var stepTxt='';
+          if(p.region_tier>0&&p.region_tier<20&&d.region_chain&&d.region_chain[p.region_tier])
+            stepTxt='第'+(p.region_tier+1)+'顺位 · ';
+          rcell='<span style="color:#f59e0b">'+esc(p.region)+'<span style="font-size:10px"> '+stepTxt+dtxt+'</span></span>';
+        }
+      }
+      h+='<tr style="border-top:1px solid rgba(255,255,255,0.06)"><td style="padding:6px 4px">CH'+p.index+'</td><td>'+esc(p.country)+'</td><td>'+rcell+'</td><td>'+esc(p.ip)+'</td><td>'+esc(p.owner||'-')+'</td><td>'+p.country_total+'</td></tr>';
+    }
+    h+='</tbody></table>';
+    var nC=Object.keys(cnt).length,shared=0;
+    for(var k in cnt)if(cnt[k]>1)shared++;
+    h+='<div style="margin-top:10px;font-size:11px;color:#6b7280">已选定 '+d.plan.length+' 个出口'
+      +(nC>1?('，覆盖 '+nC+' 个国家/地区'):'')+'，出口 IP 互不重复'+(shared?('（其中 '+shared+' 个国家被多条通道共用）'):'')+'。</div>';
+    if(wantRegion&&Object.keys(rcnt).length){
+      var parts=[];
+      for(var k2 in rcnt)parts.push(k2+'×'+rcnt[k2]);
+      h+='<div style="margin-top:6px;font-size:11px;color:#f59e0b">其中 '+near+' 条未能落在目标县，已就近递补：'+esc(parts.join('、'))+'</div>';
+    }
+    if(d.region_chain&&d.region_chain.length>1){
+      h+='<div style="margin-top:6px;font-size:11px;color:#6b7280">固定递补顺序：'
+        +esc(d.region_chain.join(' → '))+' → 其它地区由近到远；'
+        +'每退一步之前都会重扫一次当前县，有新上线的节点就留在原县；'
+        +'降级后按落点锁定该县，目标县恢复可用也不会切回。</div>';
+    }
+    if(d.note){
+      h+='<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:rgba(34,197,94,0.1);border:1px solid rgba(34,197,94,0.25);color:#22c55e;font-size:11px;line-height:1.7">'+esc(d.note)+'</div>';
+    }
+    var lack=needCount()-d.plan.length;
+    if(lack>0){
+      h+='<div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.25);color:#ef4444;font-size:11px;line-height:1.7">这个国家/地区（或这个县）当前没有可用节点（'+lack+' 个出口没排上）。换一个国家/地区，或把 IP 类型改回「不限」再试。</div>';
+    }
+    if(d.warnings&&d.warnings.length){
+      var ws='';for(var j=0;j<d.warnings.length;j++)ws+='· '+esc(d.warnings[j])+'<br>';
+      h+='<div style="margin-top:10px;padding:8px 10px;border-radius:8px;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.25);color:#f59e0b;font-size:11px;line-height:1.75">'+ws+'</div>';
+    }
+    body.innerHTML=h;
+  }catch(e){body.innerHTML='<div style="color:#ef4444;font-size:12px">规划失败: '+esc(e)+'</div>';}
+}
+async function applyAssign(){
+  if(!_assignPlan||!_assignPlan.length){asMsgA('请先规划',false);return}
+  var btn=document.getElementById('as_apply');btn.disabled=true;btn.textContent='下发中...';
+  var plan=_assignPlan.map(function(p){return p.index+':'+p.node_id}).join(',');
+  try{
+    var r=await fetch('/api/channels/auto_assign?'+asQ()+'&plan='+encodeURIComponent(plan),{method:'POST'});
+    var d=await r.json();
+    if(d.ok){
+      asMsgA('已下发，正在建立隧道（约 3 秒后开始连接）...',true);
+      setTimeout(function(){document.getElementById('assignModal').classList.remove('show');rf()},2500);
+    }else{asMsgA(d.error||'下发失败',false)}
+  }catch(e){asMsgA('下发失败: '+e,false)}
+  btn.disabled=false;btn.textContent='应用并连接';
+}
+function showAdmin(){
+  document.getElementById("adminModal").classList.add("show");
+  var m=document.getElementById("a_msg");m.style.display="none";
+  document.getElementById("a_pass").value="";
+  document.getElementById("a_newpass").value="";
+  document.getElementById("a_newpass2").value="";
+  document.getElementById("a_newuser").value="";
+  document.getElementById("a_user").value=CUR_USER||"";
+}
+function aMsg(t,ok){
+  var m=document.getElementById("a_msg");m.style.display="block";
+  m.style.color=ok?"#22c55e":"#ef4444";m.textContent=t;
+}
+async function changePwd(){
+  var u=document.getElementById("a_user").value.trim();
+  var p=document.getElementById("a_pass").value;
+  var nu=document.getElementById("a_newuser").value.trim();
+  var n=document.getElementById("a_newpass").value;
+  var n2=document.getElementById("a_newpass2").value;
+  if(!u||!p){aMsg("请先填写当前账号和当前密码",false);return}
+  if(!nu&&!n){aMsg("新账号和新密码至少填写一项",false);return}
+  if(nu&&!/^[A-Za-z0-9_.-]{3,32}$/.test(nu)){aMsg("新账号需 3~32 位，只能含字母/数字/_.-",false);return}
+  if(n&&n.length<8){aMsg("新密码至少 8 位",false);return}
+  if(n&&n2&&n!==n2){aMsg("两次输入的新密码不一致",false);return}
+  if(n&&n===p){aMsg("新密码不能与当前密码相同",false);return}
+  var btn=document.getElementById("a_submit");btn.disabled=true;btn.textContent="提交中...";
+  try{
+    var r=await fetch("/api/admin/credentials",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({username:u,password:p,new_username:nu,new_password:n,confirm_password:n2})});
+    var d=await r.json();
+    if(d.ok){
+      aMsg("修改成功！请使用新账号密码重新登录",true);
+      setTimeout(function(){location.href="/";},1800);
+    }else{aMsg(d.error||"修改失败",false)}
+  }catch(e){aMsg("请求失败: "+e,false)}
+  btn.disabled=false;btn.textContent="确认修改";
+}
+async function logout(){
+  try{await fetch("/api/logout",{method:"POST"})}catch(e){}
+  location.href="/";
+}
+</script>
+</body>
+</html>"""
+
+# === Web Server ===
+# ---- 面板只接受域名访问：用 IP:端口 直连一律 403 ----
+# 面板用的是公共 CA 签给域名的证书，用 IP 打开本来就只能看到"名字不匹配"的警告页，
+# 没有使用价值，却把 IP:8787 暴露成全网段可扫描的入口。这里按 Host 头收敛：
+#   放行 —— 证书里列出的域名；以及回环（ml status / 守护 / 升级脚本验收都打 127.0.0.1）
+#   拒绝 —— 任何纯 IP 形式的 Host，以及不在证书里的域名
+# 逃生阀（不用重启）：touch vpngate_data/allow_ip_host 立即恢复 IP 访问；
+# 也可以 rm 掉它重新收紧。判断本身出异常时一律放行，绝不把面板锁死。
+ALLOW_IP_FILE = "allow_ip_host"
+_UI_TLS_INFO: dict | None = None          # main() 里 ui_tls.setup() 之后填进来
+_ui_hosts_cache: dict = {"at": 0.0, "hosts": frozenset()}
+_ui_hosts_denied_at: list[float] = [0.0]
+
+# ---- 面板证书热重载 ----
+# acme.sh / certbot / mailcow 续期时只是把新文件**写进磁盘**，进程手里还是启动时加载的
+# SSLContext。以前靠"续期脚本重启面板"捎带解决，但重启会断开 6 条隧道；更糟的是忘了配
+# reload 就等于没续——旧证书到期那天面板直接连不上，而 IP 访问已被 403 挡住，连兜底都没有。
+# 这里改成自检：后台每分钟 stat 一次证书/私钥（mtime + size），一变就重建 context 并原子
+# 替换 DualStackServer.ssl_context。get_request() 每次 accept 都读这个类属性，所以新连接
+# 立刻用新证书、老连接照旧，隧道一次都不用断，也不依赖任何外部 reload hook。
+UI_CERT_POLL_SEC = 60
+_ui_cert_state: dict = {"stamp": None, "fails": 0}
+
+
+def _cert_file_stamp(paths) -> tuple:
+    """证书文件的"版本指纹"：(mtime_ns, size)。取不到就返回空元组。"""
+    stamp = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+        except (OSError, TypeError):
+            return ()
+        stamp.append((st.st_mtime_ns, st.st_size))
+    return tuple(stamp)
+
+
+def reload_ui_cert_if_changed(server_cls, info: dict | None = None, *,
+                              force: bool = False) -> str:
+    """证书文件变了就重建 SSLContext 并替换掉 server_cls.ssl_context。
+
+    返回 "reloaded" / "unchanged" / "failed" / "skipped"。
+    失败时**保留旧 context**（续期脚本正在覆盖文件、读到半截 PEM 是常有的事），
+    下一轮自检会重试——绝不能因为一次读失败把面板弄成没有 HTTPS。
+    """
+    global _UI_TLS_INFO
+    info = info if info is not None else _UI_TLS_INFO
+    if not info or not info.get("cert") or not info.get("key"):
+        return "skipped"
+    paths = (info["cert"], info["key"])
+    stamp = _cert_file_stamp(paths)
+    if not stamp:
+        return "failed"
+    if not force and stamp == _ui_cert_state["stamp"]:
+        return "unchanged"
+    try:
+        ctx = ui_tls.build_context(info["cert"], info["key"])
+    except Exception as e:
+        _ui_cert_state["fails"] += 1
+        n = _ui_cert_state["fails"]
+        if n in (1, 5, 30) or n % 60 == 0:
+            log(f"[UI] 证书重载失败({type(e).__name__}: {e})，继续使用旧证书，{UI_CERT_POLL_SEC}s 后重试")
+        return "failed"
+    server_cls.ssl_context = ctx
+    days = ui_tls.cert_days_left(info["cert"])
+    info["context"] = ctx
+    info["days_left"] = days
+    _UI_TLS_INFO = info
+    _ui_cert_state["stamp"] = stamp
+    _ui_cert_state["fails"] = 0
+    tail = f"，剩余 {days:.0f} 天" if isinstance(days, (int, float)) else ""
+    log(f"[UI] 检测到证书更新，已热重载（{info.get('source') or '证书'}{tail}），连接未中断")
+    return "reloaded"
+
+
+def start_ui_cert_watcher(server_cls, info: dict | None = None):
+    """起一个后台线程盯着证书文件；没有证书（明文 HTTP）就不起。"""
+    info = info if info is not None else _UI_TLS_INFO
+    if not info or not info.get("cert"):
+        return None
+    _ui_cert_state["stamp"] = _cert_file_stamp((info["cert"], info["key"]))
+    _ui_cert_state["fails"] = 0
+
+    def _loop():
+        while True:
+            time.sleep(UI_CERT_POLL_SEC)
+            try:
+                reload_ui_cert_if_changed(server_cls, info)
+            except Exception as e:      # 巡检线程绝不能死
+                log(f"[UI] 证书自检异常: {type(e).__name__}: {e}")
+
+    t = threading.Thread(target=_loop, name="ui-cert-watch", daemon=True)
+    t.start()
+    return t
+
+
+def cert_dns_names(cert_path: str) -> frozenset:
+    """读证书里所有 DNS 型 SAN（域名）。读不出来就返回空集。"""
+    try:
+        import ssl as _ssl
+        d = _ssl._ssl._test_decode_cert(cert_path)      # CPython 内部 API，只读 PEM，不发请求
+        return frozenset(v.strip().lower().rstrip(".")
+                         for k, v in d.get("subjectAltName", ())
+                         if k.upper() == "DNS" and v)
+    except Exception:
+        return frozenset()
+
+
+def cert_primary_name(cert_path: str) -> str:
+    """证书的 CN（主域名）。403 页面要推荐"用户平时用的那个域名"，
+    拿 SAN 排序第一个会推荐成 cli.xxx 这类附属域名，看着就不像正门。"""
+    try:
+        import ssl as _ssl
+        d = _ssl._ssl._test_decode_cert(cert_path)
+        for rdn in d.get("subject", ()):
+            for k, v in rdn:
+                if k == "commonName" and v:
+                    return v.strip().lower().rstrip(".")
+    except Exception:
+        pass
+    return ""
+
+
+def ui_preferred_host() -> str:
+    """给用户看的那个域名：证书 CN 优先（且必须真的在白名单里），否则取白名单里最短的。"""
+    allowed = ui_allowed_hosts()
+    if not allowed:
+        return ""
+    cn = cert_primary_name(str((_UI_TLS_INFO or {}).get("cert") or ""))
+    if cn and cn in allowed:
+        return cn
+    return sorted(allowed, key=lambda x: (len(x), x))[0]
+
+
+
+def ui_allowed_hosts() -> frozenset:
+    """面板允许的 Host 白名单。空集 = 不限制（HTTP / 自签证书 / 逃生阀打开时）。
+
+    只对"公共 CA 签发的域名证书"生效：这种部署本来就必须用域名访问，
+    自动按证书 SAN 收敛不会误伤；自签证书场景（IP、localhost）保持原样。
+    """
+    if os.path.exists(str(DATA_DIR / ALLOW_IP_FILE)):
+        return frozenset()
+    now = time.time()
+    if now - _ui_hosts_cache["at"] < 30 and _ui_hosts_cache["hosts"]:
+        return _ui_hosts_cache["hosts"]
+    info = _UI_TLS_INFO or {}
+    hosts = frozenset()
+    if info.get("cert") and not info.get("self_signed"):
+        hosts = cert_dns_names(str(info["cert"]))
+    _ui_hosts_cache.update(at=now, hosts=hosts)
+    return hosts
+
+
+def host_of(header: str) -> str:
+    """从 Host 头取出裸主机名：`a.com:8787` -> `a.com`，`[::1]:8787` -> `::1`。
+    末尾的点是合法的 FQDN 写法（`a.com.`），一并归一，否则会被误判成陌生域名。"""
+    h = (header or "").strip().lower()
+    if not h:
+        return ""
+    if h.startswith("["):
+        return h[1:].split("]")[0]
+    if ":" in h:
+        h = h.rsplit(":", 1)[0]
+    return h.rstrip(".")
+
+
+def is_loopback_host(h: str) -> bool:
+    return h in ("127.0.0.1", "::1", "localhost", "localhost.localdomain")
+
+
+def host_denied(host_header: str) -> bool:
+    """True = 这个 Host 不该访问面板。"""
+    allowed = ui_allowed_hosts()
+    if not allowed:                       # 没有域名证书可用 -> 不限制
+        return False
+    h = host_of(host_header)
+    if not h or is_loopback_host(h):      # 空 Host（脚本/HTTP/1.0）与回环一律放行
+        return False
+    try:
+        ipaddress.ip_address(h)           # 纯 IP 直连：白名单里只有域名，直接拒
+        return True
+    except ValueError:
+        pass
+    return h not in allowed
+
+
+class Handler(BaseHTTPRequestHandler):
+    def send_json(self, data: Any, status: int = HTTPStatus.OK):
+        body = json.dumps(data, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type","application/json; charset=utf-8")
+        # 面板数据必须实时：不许浏览器/中间层缓存，否则通道状态、县列表会显示成旧的
+        self.send_header("Cache-Control","no-store, must-revalidate")
+        self.send_header("Content-Length",str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+
+    def log_message(self, fmt, *args): pass
+
+    def reject_host(self) -> bool:
+        """Host 不在白名单时回 403。返回 True 表示已经处理完，调用方直接 return。"""
+        try:
+            denied = host_denied(self.headers.get("Host", ""))
+        except Exception:
+            denied = False                # 判断出错时放行，绝不把面板锁死
+        if not denied:
+            return False
+        now = time.time()
+        if now - _ui_hosts_denied_at[0] >= 60:      # 节流，别让扫描器刷爆 journal
+            _ui_hosts_denied_at[0] = now
+            log(f"[UI] 拒绝用 IP/未知域名访问面板（Host: {self.headers.get('Host','')}）"
+                f"——请改用 {ui_preferred_host()}:{UI_PORT}；"
+                f"确需 IP 访问就 touch {DATA_DIR / ALLOW_IP_FILE}")
+        main_dom = ui_preferred_host()
+        url = f"https://{main_dom}:{UI_PORT}/" if main_dom else f"https://<域名>:{UI_PORT}/"
+        body = (
+            "<!doctype html><meta charset=utf-8><title>请用域名访问</title>"
+            "<style>body{background:#141419;color:#e0e0e0;font:14px/1.7 system-ui;"
+            "display:flex;align-items:center;justify-content:center;height:100vh;margin:0}"
+            "div{max-width:560px;padding:28px 32px;background:#1a1a24;border-radius:14px;"
+            "border:1px solid rgba(255,255,255,.08)}code{background:#0f0f13;padding:2px 6px;"
+            "border-radius:6px;color:#a5b4fc}a{color:#818cf8}</style>"
+            "<div><h2 style='margin:0 0 10px'>面板不接受 IP 直连</h2>"
+            f"<p>这个面板使用域名证书，请改用：</p><p><a href='{url}'>{url}</a></p>"
+            "<p style='color:#6b7280;font-size:12px;margin-top:18px'>"
+            "用 IP 打开只会看到证书名字不匹配的警告，所以这里直接拒绝了。<br>"
+            f"管理员确实需要用 IP 访问时：在服务器上执行 "
+            f"<code>touch {DATA_DIR / ALLOW_IP_FILE}</code>（立即生效，无需重启）。</p></div>"
+        ).encode()
+        self.send_response(HTTPStatus.FORBIDDEN)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
+    def read_params(self) -> dict:
+        """读取请求体，兼容 form-urlencoded 与 JSON。"""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except Exception:
+            length = 0
+        raw = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
+        if "application/json" in (self.headers.get("Content-Type") or "").lower():
+            try:
+                d = json.loads(raw or "{}")
+                return {k: [str(v)] for k, v in d.items()} if isinstance(d, dict) else {}
+            except Exception:
+                return {}
+        return urllib.parse.parse_qs(raw)
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if self.reject_host():
+            return
+
+        if not check_auth_token(self.headers):
+            # API 路径统一返回 401 JSON，别把 HTML 登录页丢给调用方(会破坏 JSON 解析)
+            if path.startswith("/api/"):
+                self.send_json({"ok":False,"error":"unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                return
+            global LOGIN_HTML_CACHE
+            if not LOGIN_HTML_CACHE:
+                try:
+                    LOGIN_HTML_CACHE = open(str(DATA_DIR / "login.html")).read()
+                except:
+                    LOGIN_HTML_CACHE = "<html><body><h2>Login page not found</h2></body></html>"
+            err = params.get("error", [""])[0]
+            if err == "locked":
+                err_text = "失败次数过多，请稍后再试"
+            elif err == "changed":
+                err_text = "账号或密码已修改，请重新登录"
+            else:
+                err_text = "账号或密码错误"
+            body = LOGIN_HTML_CACHE.replace("${error_display}", "block" if err else "none")\
+                                   .replace("${error_text}", err_text).encode()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type","text/html; charset=utf-8")
+            # 页面内嵌了全部前端代码：不禁止缓存的话，升级后浏览器还在跑旧页面，
+            # 新加的下拉/按钮"看不见"，只能让用户手动强刷 —— 这里直接杜绝。
+            self.send_header("Cache-Control","no-store, must-revalidate")
+            self.send_header("Pragma","no-cache")
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+            return
+
+        if path in ("/","/index.html"):
+            pi_short, pi_full = proxy_info()
+            html = (PAGE_HTML.replace("{channels_json}",json.dumps([c.to_dict() for c in channels]))
+                             .replace("{proxy_info_short}", escape_html(pi_short))
+                             .replace("{proxy_info_full}", escape_html(pi_full)))
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type","text/html; charset=utf-8")
+            self.send_header("Cache-Control","no-store, must-revalidate")
+            self.send_header("Pragma","no-cache")
+            self.send_header("Content-Length",str(len(html.encode())))
+            self.end_headers(); self.wfile.write(html.encode())
+        elif path == "/api/status":
+            now_ts = time.time()
+            with nodes_cache_lock:
+                countries = sorted(set(n.get("country_long","") for n in nodes_cache if n.get("country_long")))
+                node_count = len(nodes_cache)
+                new_node_count = sum(1 for n in nodes_cache if is_new_by_ttl(n.get("first_seen", 0), now_ts))
+                newest_at = max([n.get("first_seen", 0) for n in nodes_cache] or [0])
+                tested_count = sum(1 for n in nodes_cache if n.get("test_out_at"))
+                latency_count = sum(1 for n in nodes_cache if n.get("tcp_latency"))
+            chs = [c.to_dict() for c in channels]
+            # 标记出口 IP 撞车的通道：多出口场景下重复 IP 等于白开一条通道
+            seen_out: dict[str, list[int]] = {}
+            for c in chs:
+                ip = c.get("node_ip") or c.get("reserved_ip")
+                if ip: seen_out.setdefault(ip, []).append(c["index"])
+            for c in chs:
+                ip = c.get("node_ip") or c.get("reserved_ip")
+                c["ip_dup_with"] = [i for i in seen_out.get(ip, []) if i != c["index"]] if ip else []
+            with TASK_LOCK:
+                ping_task = dict(PING_TASK)
+                speed_task = dict(SPEED_TASK)
+            speed_task.pop("results", None)   # 明细单独走 /api/nodes/speedtest
+            self.send_json({"channels":chs,"countries":countries,
+                            "country_stats":country_supply(),
+                            # 按 IP 类型分开的供给：面板选了「住宅」时，国家下拉里的
+                            # "可用 N/M" 必须只算住宅节点，否则会显示"日本还有 40 个"
+                            # 而实际只有 11 个住宅，用户以为够用、预览却降级。
+                            "country_stats_by_type":{t: country_supply(t)
+                                                     for t in IP_TYPE_KEYS},
+                            "outlets":occupied_map(),
+                            "node_count":node_count,"username":load_auth_config().get("username","admin"),
+                            "default_credentials":is_default_credentials(),
+                            "new_node_count":new_node_count,
+                            "newest_node_at":newest_at,
+                            "new_node_ttl":NEW_NODE_TTL,
+                            "tested_count":tested_count,
+                            "latency_count":latency_count,
+                            "ping_task":ping_task,
+                            "speed_task":speed_task,
+                            "nodes_source":_last_fetch_source,
+                            "nodes_snapshot_at":_snapshot_saved_at,
+                            "policy_table_base":POLICY_TABLE_BASE,
+                            **ui_tls_status()})
+        elif path == "/api/nodes":
+            filter_type = params.get("filter",[""])[0]
+            country = params.get("country",[""])[0]
+            region = params.get("region",[""])[0]
+            ip_type = params.get("ip_type",[""])[0]
+            sort_by = params.get("sort",[""])[0]
+            now_ts = time.time()
+            with nodes_cache_lock:
+                nodes = list(nodes_cache)
+            # 行政区过滤：参数可以是下拉传回来的键（JP-13），也可以是中文名（东京都）
+            region_keys: set[str] = set()
+            if region:
+                r_tgt = region_geo.resolve_target(region, country)
+                if r_tgt and r_tgt.get("key"):
+                    region_keys.add(str(r_tgt["key"]).upper())
+                region_keys.add(region.strip().upper())
+            result = []
+            for n in nodes:
+                ip = n.get("ip","")
+                port = n.get("port","443")
+                available = n.get("ping",999) > 0 and n.get("ping",999) < 999  # rough availability
+                # Actually check: the node has config_text means it has a config
+                available = bool(n.get("config_text"))
+                n_country = n.get("country_long","")
+                n_ip_type = n.get("ip_type","")
+                first_seen = float(n.get("first_seen") or 0)
+                is_new = is_new_by_ttl(first_seen, now_ts)
+                if country and country.lower() not in n_country.lower(): continue
+                if region_keys:
+                    n_rk = (n.get("region_key") or "").strip().upper()
+                    n_rn = (n.get("region") or "").strip().upper()
+                    if not (n_rk in region_keys or n_rn in region_keys):
+                        continue
+                if ip_type and n_ip_type != ip_type: continue
+                if filter_type == "available" and not available: continue
+                if filter_type == "failed" and available: continue
+                if filter_type == "new" and not is_new: continue
+                if filter_type == "tested" and not n.get("test_out_at"): continue
+                if filter_type == "untested" and n.get("test_out_at"): continue
+                result.append({
+                    "id": n.get("id",""), "ip": ip, "port": port,
+                    "country_long": n_country, "available": available,
+                    "location": n.get("location",""), "owner": n.get("owner",""),
+                    "region": n.get("region",""), "region_key": n.get("region_key",""),
+                    "region_zone": n.get("region_zone",""), "city": n.get("city",""),
+                    "lat": n.get("lat"), "lon": n.get("lon"),
+                    "ip_type": n_ip_type, "asn": n.get("asn",""),
+                    "ip_confidence": n.get("ip_confidence",""),
+                    "ip_reason": n.get("ip_reason",""),
+                    "is_vpn_exit": n.get("is_vpn_exit", False),
+                    "is_new": is_new,
+                    "first_seen": first_seen,
+                    "new_age_s": int(max(0, now_ts - first_seen)) if first_seen else 0,
+                    "ping": n.get("ping", 0) or 0,            # VPNGate 官方延迟(来自日本节点)
+                    "speed": n.get("speed", 0) or 0,          # VPNGate 官方带宽(bps，上线时测的)
+                    "tcp_latency": n.get("tcp_latency", 0) or 0,   # 本机实测 TCP 延迟
+                    "tcp_latency_at": n.get("tcp_latency_at", 0) or 0,
+                    "test_out_mbps": n.get("test_out_mbps", 0) or 0,
+                    "test_out_at": n.get("test_out_at", 0) or 0,
+                    "test_out_error": n.get("test_out_error", "") or "",
+                })
+            if sort_by == "new":
+                result.sort(key=lambda x: x["first_seen"], reverse=True)
+            elif sort_by == "latency":
+                # 没测到的排最后，别让 0 混在"最快"里
+                result.sort(key=lambda x: (x["tcp_latency"] if x["tcp_latency"] > 0 else 10 ** 9))
+            elif sort_by == "mbps":
+                result.sort(key=lambda x: x["test_out_mbps"] if x["test_out_at"] else -1,
+                            reverse=True)
+            elif sort_by == "official":
+                result.sort(key=lambda x: x["speed"], reverse=True)
+            # 与节点池上限(300)对齐，避免"看不见的节点却被自动选中"
+            self.send_json({"nodes":result[:300], "total":len(result)})
+        elif path == "/api/regions":
+            # 某国家下可选的行政区（县/都道府县/州）+ 各自节点数。
+            # 日本会把 47 个全部返回（0 节点的也在），这样"选了东京都但暂时没节点"
+            # 也能触发后端的就近降级，而不是在面板上根本选不到目标县。
+            country = (params.get("country",[""])[0] or "").strip()
+            ip_type = (params.get("ip_type",[""])[0] or "").strip()
+            if not country:
+                self.send_json({"ok": False, "error": "缺少 country 参数",
+                                "regions": []}, HTTPStatus.BAD_REQUEST)
+                return
+            rows = region_supply(country, ip_type)
+            # 固定递补顺序（只有配了 NEAR_FIRST 的县才有，目前是日本东京都），
+            # 面板据此直接写清"没拿到东京都时按 埼玉→神奈川→千叶→山梨 往下退"。
+            chains = {}
+            for r in rows:
+                names = region_geo.near_first_names(r["key"])
+                if len(names) > 1:
+                    chains[r["key"]] = names
+            self.send_json({"ok": True, "country": country, "regions": rows,
+                            "ip_type": type_key(ip_type),
+                            "chains": chains,
+                            "has_presets": bool(region_geo.options_for(country))})
+        elif path == "/api/nodes/speedtest":
+            # 批量真实测速的完整明细（含每个节点的成功/失败原因）
+            with TASK_LOCK:
+                task = dict(SPEED_TASK)
+            self.send_json(task)
+        elif path == "/api/nodes/ping":
+            with TASK_LOCK:
+                task = dict(PING_TASK)
+            self.send_json(task)
+        else:
+            self.send_json({"error":"not found"}, HTTPStatus.NOT_FOUND)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if self.reject_host():
+            return
+
+        # 除登录/登出接口外，所有写操作必须已登录。
+        # 原来 do_POST 完全没有鉴权，任何人从公网都能调 connect/disconnect/toggle，
+        # 等于把整台机器的出口控制权敞开。
+        if path not in ("/api/login", "/api/logout") and not check_auth_token(self.headers):
+            self.send_json({"ok": False, "error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+
+        # Logout
+        if path == "/api/logout":
+            cookie = self.headers.get("Cookie","") or ""
+            for part in cookie.split(";"):
+                part = part.strip()
+                if part.startswith("token="):
+                    auth_token_store.pop(part[6:], None)
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Set-Cookie", "token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+
+        # Login POST endpoint
+        if path == "/api/login":
+            ip = self.client_address[0]
+            locked = is_login_locked(ip)
+            if locked:
+                log(f"[auth] 登录被限速 from {ip} ({locked}s)")
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", "/?error=locked")
+                self.end_headers()
+                return
+            try:
+                p = self.read_params()
+                user = (p.get("username", [""])[0] or "").strip()
+                pwd = (p.get("password", [""])[0] or "").strip()
+                if verify_credentials(user, pwd):
+                    clear_login_failures(ip)
+                    tok = generate_token()
+                    self.send_response(HTTPStatus.FOUND)
+                    self.send_header("Set-Cookie", f"token={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400")
+                    self.send_header("Location", "/")
+                    self.end_headers()
+                else:
+                    record_login_failure(ip)
+                    log(f"[auth] 登录失败 user={user!r} from {ip}")
+                    self.send_response(HTTPStatus.FOUND)
+                    self.send_header("Location", "/?error=1")
+                    self.end_headers()
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if re.match(r"^/api/channel/\d+/toggle$", path):
+            m2 = re.match(r"/api/channel/(\d+)/toggle", path)
+            if m2:
+                idx2 = int(m2.group(1))
+                if idx2 < 0 or idx2 >= NUM_CHANNELS:
+                    self.send_json({"error": "out of range"}, HTTPStatus.BAD_REQUEST)
+                    return
+                en = params.get("enabled",["0"])[0] == "1"
+                channels[idx2].enabled = en
+                save_channels()
+                self.send_json({"ok":True, "enabled": en})
+                return
+
+        if path == "/api/fetch_nodes":
+            res = manual_fetch()
+            self.send_json({"ok": True, "new": res["new"], "dup": res["dup"],
+                            "total": res["total"], "baseline": res["baseline"],
+                            "new_ids": res["new_ids"], "source": res.get("source", "")})
+            return
+
+        # --- 清空"新"标记（首现历史保留，只挪水位线）---
+        if path == "/api/nodes/clear_new":
+            with nodes_cache_lock:
+                cnt = sum(1 for n in nodes_cache if is_new_by_ttl(n.get("first_seen", 0)))
+            clear_new_marks()
+            self.send_json({"ok": True, "cleared": cnt})
+            return
+
+        # --- 延迟测试：对节点 IP:端口做 TCP 握手 RTT，并发跑，零流量 ---
+        if path == "/api/nodes/ping":
+            ids_q = (params.get("ids", [""])[0] or "").strip()
+            ids = [x.strip() for x in ids_q.split(",") if x.strip()] if ids_q else None
+            res = start_ping_task(ids)
+            self.send_json(res, HTTPStatus.OK if res.get("ok") else HTTPStatus.CONFLICT)
+            return
+
+        # --- 真实带宽测速：用测速专用口逐个建隧道实测（不占用 ch0~ch5）---
+        if path == "/api/nodes/speedtest":
+            ids_q = (params.get("ids", [""])[0] or "").strip()
+            ids = [x.strip() for x in ids_q.split(",") if x.strip()] if ids_q else None
+            limit_q = (params.get("limit", [""])[0] or "").strip()
+            limit = int(limit_q) if limit_q.isdigit() else None
+            res = start_node_speed_task(ids, limit)
+            self.send_json(res, HTTPStatus.OK if res.get("ok") else HTTPStatus.CONFLICT)
+            return
+
+        if path == "/api/nodes/speedtest_stop":
+            res = stop_node_speed_task()
+            self.send_json(res, HTTPStatus.OK if res.get("ok") else HTTPStatus.CONFLICT)
+            return
+
+        # --- 通道测速：直接走该通道自己的 SOCKS 口，不影响其它通道 ---
+        if path == "/api/channels/speedtest":
+            res = start_all_channel_speedtest()
+            self.send_json(res, HTTPStatus.OK if res.get("ok") else HTTPStatus.CONFLICT)
+            return
+
+        m_speed = re.match(r"^/api/channel/(\d+)/speedtest$", path)
+        if m_speed:
+            i_speed = int(m_speed.group(1))
+            if i_speed < 0 or i_speed >= NUM_CHANNELS:
+                self.send_json({"ok": False, "error": "out of range"}, HTTPStatus.BAD_REQUEST)
+                return
+            res = start_channel_speedtest(channels[i_speed])
+            self.send_json(res, HTTPStatus.OK if res.get("ok") else HTTPStatus.CONFLICT)
+            return
+
+        # 修改管理账号 / 密码（旧路径 /api/admin/change_password 保留兼容）
+        if path in ("/api/admin/credentials", "/api/admin/change_password"):
+            ip = self.client_address[0]
+            try:
+                p = self.read_params()
+                legacy = path.endswith("change_password")
+                user = (p.get("username", [""])[0] or "").strip()
+                pwd = (p.get("password", [""])[0] or "").strip()
+                new_user = (p.get("new_username", [""])[0] or "").strip()
+                new_pwd = (p.get("new_password", [""])[0] or "").strip()
+                confirm = (p.get("confirm_password", [""])[0] or "").strip()
+
+                locked = is_login_locked(ip)
+                if locked:
+                    self.send_json({"ok": False, "error": f"尝试次数过多，请 {locked} 秒后再试"},
+                                   HTTPStatus.TOO_MANY_REQUESTS)
+                    return
+                if not verify_credentials(user, pwd):
+                    record_login_failure(ip)
+                    log(f"[auth] 修改凭据: 当前账号密码校验失败 user={user!r} from {ip}")
+                    self.send_json({"ok": False, "error": "当前账号或密码错误"}, HTTPStatus.UNAUTHORIZED)
+                    return
+                if legacy and not new_pwd:
+                    self.send_json({"ok": False, "error": "密码至少 8 位"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if not new_user and not new_pwd:
+                    self.send_json({"ok": False, "error": "新账号和新密码至少填写一项"}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                cfg = load_auth_config()
+                cur_user = str(cfg.get("username", "admin"))
+                final_user = new_user or cur_user
+                if new_user:
+                    err = validate_username(new_user)
+                    if err:
+                        self.send_json({"ok": False, "error": err}, HTTPStatus.BAD_REQUEST)
+                        return
+                if new_pwd:
+                    if confirm and confirm != new_pwd:
+                        self.send_json({"ok": False, "error": "两次输入的新密码不一致"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    err = validate_password(new_pwd, final_user)
+                    if err:
+                        self.send_json({"ok": False, "error": err}, HTTPStatus.BAD_REQUEST)
+                        return
+                    if hmac.compare_digest(new_pwd, pwd):
+                        self.send_json({"ok": False, "error": "新密码不能与当前密码相同"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    final_pwd = new_pwd
+                else:
+                    # 只改账号：沿用当前密码重新哈希落盘
+                    final_pwd = pwd
+                    if final_user == cur_user:
+                        self.send_json({"ok": False, "error": "新账号与当前账号相同"}, HTTPStatus.BAD_REQUEST)
+                        return
+
+                clear_login_failures(ip)
+                save_auth_config(final_user, final_pwd)
+                invalidate_all_sessions()   # 所有已登录会话立即失效，强制重新登录
+                log(f"[auth] 管理凭据已更新: 账号 {cur_user} -> {final_user}"
+                    + ("，密码已同步变更" if new_pwd else "") + f"，来源 {ip}")
+                self.send_json({"ok": True, "username": final_user, "password_changed": bool(new_pwd),
+                                "message": "修改成功，请使用新账号密码重新登录"})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        # 一键分配：为出口规划节点（单通道就是规划这一个出口）
+        #   mode=country 尽量每条通道一个国家(国家不够时在节点多的国家多开, IP 仍不重复)
+        #   mode=same    所有通道固定 country 指定的同一个国家(只要求 6 个出口 IP 互不相同)
+        #   mode=ip      不限国家, 只保证 6 个出口 IP 互不相同
+        #   fill=1       mode=same 时该国节点不够则用其它国家补满剩余通道
+        #   region       mode=same 时再精确到行政区(日本=都道府县, 如 JP-13 / 东京都)；
+        #                该县没可用节点会自动按"同大区 -> 全国由近到远"降级
+        #   dry_run=1    只返回方案供确认, 不实际连线
+        if path == "/api/channels/auto_assign":
+            mode = (params.get("mode",["country"])[0] or "country").strip()
+            ip_type = (params.get("ip_type",[""])[0] or "").strip()
+            country = (params.get("country",[""])[0] or "").strip()
+            region = (params.get("region",[""])[0] or "").strip()
+            fill = params.get("fill",["0"])[0] == "1"
+            dry = params.get("dry_run",["0"])[0] == "1"
+            scope = (params.get("count",[""])[0] or "").strip()
+            plan_q = (params.get("plan",[""])[0] or "").strip()
+            targets = channels
+            if scope.isdigit():
+                targets = channels[:max(1, min(NUM_CHANNELS, int(scope)))]
+            res = None
+            if not dry and plan_q:
+                # 前端把预览过的方案带回来，避免"预览一套、应用另一套"
+                items = []
+                for pair in plan_q.split(","):
+                    if ":" not in pair:
+                        continue
+                    a, b = pair.split(":", 1)
+                    if not a.strip().isdigit() or not b.strip():
+                        continue
+                    node = get_node_by_id(b.strip())
+                    if not node:
+                        continue
+                    items.append({"index":int(a.strip()), "node_id":b.strip(),
+                                  "country":node.get("country_long",""),
+                                  "region":node.get("region",""),
+                                  "region_key":node.get("region_key",""),
+                                  "ip":node.get("ip",""),
+                                  "ip_type":node.get("ip_type","")})
+                if items:
+                    res = {"plan": items, "warnings": []}
+            if res is None:
+                res = build_assign_plan(targets, mode, ip_type, country, fill, region)
+            if not res["plan"]:
+                self.send_json({"ok":False, "error":"；".join(res["warnings"]) or "没有可用节点",
+                                "warnings":res["warnings"]}, HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            if dry:
+                self.send_json({"ok":True, "dry_run":True, "plan":res["plan"],
+                                "warnings":res["warnings"], "note":res.get("note",""),
+                                "countries":res["countries"],
+                                "regions":res.get("regions") or [],
+                                "region_chain":res.get("region_chain") or [],
+                                "region":res.get("region") or ""})
+                return
+            applied, failed = [], []
+            for i, item in enumerate(res["plan"]):
+                ch = channels[item["index"]]
+                # 这是一次"重新分配"，用户明确点了应用：清掉旧的锁定，
+                # 让规划结果（目标县 + 固定顺序）重新生效；连上后会按实际落点重新锁。
+                ch.region_lock = ""
+                node = get_node_by_id(item["node_id"]) or get_best_node_for_country(
+                    item["country"], item["ip_type"], exclude_ch=ch, region=region, locked="")
+                if not node:
+                    failed.append({"index":item["index"], "country":item["country"],
+                                   "error":"节点已失效且无备选"})
+                    continue
+                # 先断开原连接，否则错峰重连会看到 connected 直接跳过
+                disconnect_channel(ch)
+                ch.force_country = item["country"]
+                # 记住"用户要的是哪个县"，而不是"这次恰好落到了哪个县" ——
+                # 这样通道掉线重连时会重新按"同县优先、没有就就近"再挑一次。
+                ch.force_region = region if mode == "same" else ""
+                ch.force_ip_type = ip_type          # 未指定类型则不限，重连时备选更多
+                ch.reserved_ip = node.get("ip","")
+                ch.enabled = True
+                save_channels()
+                threading.Thread(target=_delayed_connect, args=(ch, node, i * 3), daemon=True).start()
+                applied.append({"index":item["index"], "country":item["country"],
+                                "region":node.get("region",""),
+                                "ip":node.get("ip",""), "owner":node.get("owner",""),
+                                "ip_type":node.get("ip_type","")})
+            log(f"[assign] mode={mode} 已下发 {len(applied)} 条通道的出口分配")
+            self.send_json({"ok":True, "applied":applied, "failed":failed,
+                            "warnings":res["warnings"]})
+            return
+
+        m = re.match(r"^/api/channel/(\d+)/(connect|disconnect)$", path)
+        if not m: self.send_json({"error":"not found"}, HTTPStatus.NOT_FOUND); return
+        idx = int(m.group(1)); action = m.group(2)
+        if idx < 0 or idx >= NUM_CHANNELS: self.send_json({"error":"out of range"}, HTTPStatus.BAD_REQUEST); return
+        ch = channels[idx]
+        # 测速进行中不准动这条通道：拆隧道会让测速结果变成 0，看起来像节点有问题
+        if ch.speed_testing:
+            self.send_json({"ok": False, "error": f"CH{idx} 正在测速，请等它测完再操作"},
+                           HTTPStatus.CONFLICT)
+            return
+        if action == "disconnect":
+            disconnect_channel(ch)
+            # 国家/IP 类型的设定保留：断开只是想停这条通道，不是想清掉它的固定出口配置
+            save_channels()
+            self.send_json({"ok":True,"channel":ch.to_dict()})
+        else:
+            node_id = params.get("node_id",[None])[0]
+            country = params.get("country",[""])[0]
+            region = params.get("region",[""])[0]
+            ip_type = params.get("ip_type",[""])[0]
+            if node_id:
+                node = get_node_by_id(node_id)
+                if not node: self.send_json({"error":"node not found"}, HTTPStatus.NOT_FOUND); return
+                # occupied_index() 是 {IP: 通道号}；这里要排除本通道自己，
+                # 否则"重连到自己正在用的节点"会被误判成被占用。
+                dup = occupied_index(ch)
+                if node.get("ip","") in dup:
+                    self.send_json({"ok":False,"error":"该节点出口 IP 已被 CH%d 占用" % dup[node["ip"]]},
+                                   HTTPStatus.CONFLICT)
+                    return
+                # Also set force_country so watchdog can auto-reconnect
+                node_country = node.get("country_long","")
+                if node_country: ch.force_country = node_country
+                node_iptype = node.get("ip_type","")
+                if node_iptype: ch.force_ip_type = node_iptype
+                # 手动挑的节点：把它的行政区也记下来，重连时尽量留在同一个县
+                ch.force_region = node.get("region_key") or node.get("region") or ""
+                # 用户亲手点的节点，就是这条通道的"目标"，同步锁上，
+                # 免得看门狗下次重连时按旧的降级顺序飘到别处
+                ch.region_lock = (node.get("region_key") or "").strip().upper()
+                ch.reserved_ip = node.get("ip","")
+                ch.enabled = True
+                save_channels()
+            else:
+                # sticky=1：守护重连专用。完全沿用通道现有设定 —— 不覆盖用户选的县、
+                # 不清降级锁。用户没选过县时用上一个节点的县做提示，
+                # 做到「同一城市还有可用 IP 就留原地，没了才就近换」。
+                sticky = (params.get("sticky", [""])[0] or "").lower() in ("1", "true", "yes")
+                if sticky:
+                    if not ch.force_country:
+                        self.send_json({"ok": False,
+                                        "error": "sticky 重连要求该通道已设定固定出口"},
+                                       HTTPStatus.BAD_REQUEST); return
+                    region_hint = ch.force_region
+                    if not region_hint and ch.last_node_data:
+                        region_hint = (ch.last_node_data.get("region_key")
+                                       or ch.last_node_data.get("region") or "").strip()
+                    node = get_best_node_for_country(ch.force_country, ch.force_ip_type,
+                                                     exclude_ch=ch, region=region_hint)
+                    if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
+                    ch.enabled = True
+                    save_channels()
+                    ok = connect_channel(ch, node)
+                    self.send_json({"ok":ok,"channel":ch.to_dict()})
+                    return
+                node = get_best_node_for_country(country, ip_type, exclude_ch=ch,
+                                                 region=region, locked="")
+                if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
+                # 显式提交就生效：country 传空表示"自动选择"，即不限国家
+                ch.force_country = country
+                ch.force_region = region
+                # 重新指定过县了，旧的降级锁定作废（连上后按新落点重新锁）
+                ch.region_lock = ""
+                ch.force_ip_type = ip_type
+                ch.enabled = True
+                save_channels()
+            ok = connect_channel(ch, node)
+            self.send_json({"ok":ok,"channel":ch.to_dict()})
+
+# === Main ===
+def connect_and_track(ch: Channel, node: dict) -> bool:
+    """发起连接并维护通道的失败计数 —— 指数退避就是靠这个计数推出来的。
+
+    启动首连和看门狗重连都走这里，避免两条路径的计数口径不一致
+    （否则开机时连不上不会累计退避，只有看门狗触发的重连才会）。
+    """
+    try:
+        ok = connect_channel(ch, node)
+    except Exception as e:
+        log(f"[CH{ch.index}] connect error: {e}")
+        ok = False
+    with ch.lock:
+        if ok:
+            ch.connect_fails = 0
+        else:
+            ch.connect_fails = getattr(ch, "connect_fails", 0) + 1
+        fails = ch.connect_fails
+    if not ok:
+        cooldown = min(RECONNECT_COOLDOWN * (2 ** min(max(fails - 1, 0), 8)), MAX_RECONNECT_BACKOFF)
+        log(f"[CH{ch.index}] 建隧道失败 {fails} 次，退避 {cooldown} 秒后再试（节点 {node.get('ip', '')}）")
+    return ok
+
+
+def _delayed_connect(ch: Channel, node: dict, delay: float):
+    """错峰重连：等待期间若别的路径已经把它连上了，就不要再抢同一个 tun。"""
+    try:
+        time.sleep(delay)
+        with ch.lock:
+            if ch.state == "connecting" or ch.state == "connected":
+                return
+        connect_and_track(ch, node)
+    except Exception as e:
+        log(f"[WD CH{ch.index}] delayed connect error: {e}")
+
+
+def channel_watchdog():
+    """通道巡检：进程存活 + 隧道实测连通性，连续多轮不通才重连。"""
+    while True:
+        time.sleep(WATCHDOG_INTERVAL)
+        for ch in channels:
+            try:
+                # 先取快照，探测动作不持锁，避免把面板操作卡住
+                with ch.lock:
+                    state = ch.state
+                    proc = ch.process
+                    tun = ch.tun
+                    force_country = ch.force_country
+                    force_region = ch.force_region
+                    region_lock = ch.region_lock
+                    enabled = ch.enabled
+                    last_connect_at = ch.last_connect_at
+
+                if state == "connecting":
+                    continue
+
+                if state == "connected":
+                    proc_alive = True
+                    try:
+                        if proc is None or proc.poll() is not None:
+                            proc_alive = False
+                    except Exception:
+                        proc_alive = False
+
+                    if proc_alive and vpn_utils.probe_tunnel(tun, timeout=3):
+                        ch.fail_streak = 0
+                        continue
+
+                    # 单次抖动不算死：连续 FAIL_TOLERANCE 轮探测不通才动手
+                    ch.fail_streak = getattr(ch, "fail_streak", 0) + 1
+                    reason = "进程退出" if not proc_alive else "隧道不通"
+                    if ch.fail_streak < FAIL_TOLERANCE:
+                        log(f"[WD CH{ch.index}] {reason} ({ch.fail_streak}/{FAIL_TOLERANCE})，继续观察")
+                        continue
+                    ch.fail_streak = 0
+                    with ch.lock:
+                        stop_process(ch.process)
+                        ch.process = None
+                        cleanup_policy_routing(policy_table(ch.index))
+                        ch.state = "disconnected"
+                        ch.last_node_data = None
+                    log(f"[WD CH{ch.index}] {reason} 连续 {FAIL_TOLERANCE} 轮，准备重连")
+
+                with ch.lock:
+                    state = ch.state
+                if state in ("disconnected", "error") and force_country and enabled:
+                    # 指数退避：连续建隧道失败时把冷却时间翻倍，最多 MAX_RECONNECT_BACKOFF。
+                    # 原来是固定 RECONNECT_COOLDOWN(90s)，节点永远连不上时就变成永久
+                    # 90 秒一次的重连风暴 —— 面板上看着就像"服务在无限重启"。
+                    fails = getattr(ch, "connect_fails", 0)
+                    cooldown = min(RECONNECT_COOLDOWN * (2 ** min(max(fails - 1, 0), 8)),
+                                   MAX_RECONNECT_BACKOFF)
+                    if time.time() - last_connect_at < cooldown:
+                        continue
+                    # 优先连回同一个节点（出口 IP 不变）
+                    node = None
+                    last = ch.last_node_data
+                    # 用带通道号的视图：日志里要写出"被哪条通道占了"，
+                    # 拿 set 去下标会抛 'set' object is not subscriptable（见 occupied_index 注释）
+                    dup = occupied_index(ch)
+                    tk = type_key(ch.force_ip_type)
+                    if last and last.get("config_text"):
+                        if last.get("ip","") in dup:
+                            log(f"[WD CH{ch.index}] 原节点 {last.get('ip','')} 已被 CH{dup[last['ip']]} 占用，改选新节点")
+                        elif tk and (last.get("ip_type") or "") != tk:
+                            # 用户改了 IP 类型（比如刚切成"住宅"）：旧节点是机房，不能因为
+                            # "连回原节点最省事"就继续用它，重新按类型+县挑一个。
+                            log(f"[WD CH{ch.index}] 原节点 {last.get('ip','')} 是"
+                                f"{ip_type_label(last.get('ip_type') or '') or '未知'}类型，"
+                                f"与当前要求的{ip_type_label(tk)}不符，改选新节点")
+                        else:
+                            node = last
+                            ch.reserved_ip = last.get("ip","")
+                            log(f"[WD CH{ch.index}] Retry same node {last.get('ip','')}")
+                    if node is None:
+                        # 「IP 不能用了才换，同城优先」：
+                        #   用户选过县 -> 同县 -> 固定顺序/由近到远递补（原有行为）；
+                        #   用户只选了国家 -> 用**上一个节点的县**做提示：该市还有
+                        #   可用 IP 就留在原地，真没了才就近换，而不是全国乱跳。
+                        #   以此类推：落在埼玉后，下次优先还是埼玉。
+                        region_hint = force_region
+                        if not region_hint and last:
+                            region_hint = (last.get("region_key")
+                                           or last.get("region") or "").strip()
+                        node = get_best_node_for_country(force_country, ch.force_ip_type,
+                                                         exclude_ch=ch, region=region_hint)
+                    if node:
+                        # 已锁定县时把锁定点也打出来：一眼能看出"不会再切回目标县"
+                        where = force_region
+                        if region_lock and region_lock != (region_key_of(force_region) or ""):
+                            pref = region_geo.lookup_prefecture(region_lock)
+                            where = f"{force_region}→锁定 {pref['name'] if pref else region_lock}"
+                        log(f"[WD CH{ch.index}] Reconnect {force_country} "
+                            f"{where} {ch.force_ip_type}".replace("  ", " "))
+                        delay = ch.index * 2  # 错峰，避免多条隧道同时抢带宽
+                        threading.Thread(target=_delayed_connect, args=(ch, node, delay), daemon=True).start()
+                    else:
+                        now = time.time()
+                        tl = ip_type_label(type_key(ch.force_ip_type))
+                        # 没有可用节点时每 15 秒打一行日志会刷爆 journal，
+                        # 这里节流到 NO_NODE_LOG_INTERVAL，并把原因写进通道状态给面板看。
+                        if now - getattr(ch, "no_node_at", 0.0) >= NO_NODE_LOG_INTERVAL:
+                            ch.no_node_at = now
+                            log(f"[WD CH{ch.index}] 全池都没有可用出口节点"
+                                f"（首选 {force_country or '任意国家'} {ch.force_ip_type}"
+                                f"{'，只算' + tl + ' IP、机房已排除' if tl else ''}，"
+                                f"另有 {skip_count()} 个节点处于短期跳过中），已退避"
+                                f" {NO_NODE_LOG_INTERVAL // 60} 分钟后复查")
+                        want = f"{force_country or '任意国家'} {tl}".strip()
+                        with ch.lock:
+                            ch.error = (f"没有可用的{tl}出口节点（{want}，已排除机房等其它类型）"
+                                        if tl else f"没有可用的出口节点（{want}）")
+            except Exception as e:
+                log(f"[WD CH{ch.index}] Error: {e}")
+
+def main():
+    log("=== MichaelVPN One (single-port) Manager + Node UI ===")
+    global GUARD_TOKEN
+    migrate_plaintext_credentials()
+    GUARD_TOKEN = load_or_create_guard_token()
+    load_seen_nodes()   # 必须在采集线程启动前恢复基准，否则重启会把整池节点当成新节点刷一遍
+    # 注意：失败节点只做**进程内**短期跳过，不落盘，所以这里没有"载入名单"这一步
+    # —— 重启后所有节点都重新参与选择（节点可能早就恢复了）。
+    if is_default_credentials():
+        log("[auth] 提醒: 面板仍是默认账号 admin/admin，请登录后点右上角\"管理员\"修改")
+    # 清理上次运行残留：只动**本程序启动的** openvpn。
+    # 原实现是一句裸的 pkill -f openvpn，会把这台机器上别的 openvpn（另一个出口、
+    # 或正在手工调试的隧道）一起干掉，而且不留痕迹。
+    cleanup_stale_openvpn()
+    for ch in channels:
+        # tun 设备已经随进程消失，但上次写的 ip rule/route 会留在内核里继续劫持流量
+        cleanup_policy_routing(policy_table(ch.index))
+    # 测速口上次被杀掉时也会留下自己的 ip rule（表号 = 209），一起清掉
+    cleanup_policy_routing(policy_table(speedtest_ch.index))
+    port_problems = preflight_ports()
+    for msg in port_problems.values():
+        log(f"[init] 端口预检: {msg}")
+    ch_cfg = read_json(CHANNELS_FILE)
+    for ch in channels:
+        c = ch_cfg.get(str(ch.index),{})
+        ch.force_country = c.get("force_country","")
+        ch.force_region = c.get("force_region","")
+        ch.region_lock = c.get("region_lock","")
+        ch.force_ip_type = c.get("force_ip_type","")
+        ch.enabled = c.get("enabled", bool(ch.force_country))
+    proxy_failures = start_all_proxies()
+    if proxy_failures:
+        log(f"[init] 警告: {len(proxy_failures)} 个通道的本地代理没起来，"
+            f"这些通道即使隧道通了也无法通过代理访问（面板会标红）")
+    # 测速专用口：起不来不影响任何通道，只在「测带宽」时再试一次
+    ensure_speedtest_proxy()
+    threading.Thread(target=collector_loop, daemon=True).start()
+    log("[init] Collector started")
+    threading.Thread(target=channel_watchdog, daemon=True).start()
+    log("[init] Watchdog started")
+    time.sleep(2)
+    # 首次采集（走统一入口，保证新节点标记与后续每轮口径一致）
+    init_fetch = refresh_nodes_once("init")
+    if not init_fetch.get("total"):
+        log("[init] 警告: 首次节点采集为空（网络不通或节点源不可用），"
+            "守护进程会在下一轮重试；也可在面板点\"获取节点\"")
+    for ch in channels:
+        if ch.force_country:
+            node = get_best_node_for_country(ch.force_country, ch.force_ip_type,
+                                             exclude_ch=ch, region=ch.force_region)
+            if node:
+                threading.Thread(target=connect_and_track, args=(ch, node), daemon=True).start()
+                time.sleep(2)
+    # 面板加密：优先复用机器上已有的证书（s-ui / acme.sh / Let's Encrypt…），
+    # 没有才自签。找不到可用的就继续明文 HTTP —— 证书问题绝不能让面板起不来。
+    global _ui_tls_info, _UI_TLS_INFO
+    _ui_tls_info = ui_tls.setup(DATA_DIR)
+    _UI_TLS_INFO = _ui_tls_info
+    if _ui_tls_info:
+        log(f"[UI] https://{UI_HOST}:{UI_PORT}/  {ui_tls.cert_summary(_ui_tls_info)}")
+        _allow = ui_allowed_hosts()
+        if _allow:
+            log(f"[UI] 只接受域名访问：{ui_preferred_host()}:{UI_PORT}"
+                f"（全部放行域名：{', '.join(sorted(_allow))}；"
+                f"用 IP 直连会返回 403，临时放开请 touch {DATA_DIR / ALLOW_IP_FILE}）")
+        else:
+            log(f"[UI] 未限制访问域名（自签证书，或已打开 {ALLOW_IP_FILE}）")
+    else:
+        log(f"[UI] http://{UI_HOST}:{UI_PORT}/  （明文，未启用 HTTPS）")
+    _ui_ssl_ctx = _ui_tls_info["context"] if _ui_tls_info else None
+
+    class DualStackServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+        # 默认 backlog 只有 5，排队一满内核就丢 SYN，表现为"连接超时"，
+        # 很容易被误判成防火墙或证书问题。
+        request_queue_size = 128
+        ssl_context = _ui_ssl_ctx
+        # 单个连接的 TLS 握手最长允许时间。没有它，主线程会被一个连进来
+        # 却不发 ClientHello 的客户端永久拖死（详见 get_request 注释）。
+        handshake_timeout = 20
+
+        def get_request(self):
+            """接一条连接并完成 TLS 握手。
+
+            关键：监听套接字必须保持明文。以前是把加密后的 socket 直接赋给
+            server.socket，于是 socketserver 走到 SSLSocket.accept()，而该函数
+            在 accept 返回的同时就同步执行 do_handshake()。碰上只建 TCP 连接、
+            不发 ClientHello 的客户端（端口扫描器很常见），主线程会永远卡在
+            read()，serve_forever() 再也回不到 accept 循环 —— 面板就此瘫痪，
+            而隧道和采集线程一切照常，从 systemd 状态完全看不出来。
+            """
+            if not self.ssl_context:
+                return self.socket.accept()
+            while True:
+                sock, addr = self.socket.accept()   # 明文 accept，不会被慢客户端卡住
+                try:
+                    sock.settimeout(self.handshake_timeout)
+                    conn = self.ssl_context.wrap_socket(sock, server_side=True)
+                    conn.settimeout(None)            # 握手成功后交还给正常的请求处理
+                    return conn, addr
+                except Exception as e:
+                    # 握手失败或超时：丢掉这条连接，主线程继续服务下一个请求，
+                    # 不能让单个异常连接拖垮整个面板。
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    log(f"[UI] TLS 握手失败({type(e).__name__})，已丢弃 {addr[0]}:{addr[1]}")
+
+    try:
+        server = DualStackServer((UI_HOST, UI_PORT), Handler)
+    except Exception:
+        server = DualStackServer(("0.0.0.0", UI_PORT), Handler)
+    # 证书续期（acme.sh / certbot / mailcow）只改磁盘上的文件，不会通知进程。
+    # 从这一刻起每分钟自检一次，文件一变就热重载，不重启、不断隧道。
+    start_ui_cert_watcher(DualStackServer, _ui_tls_info)
+    server.serve_forever()
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("--set-credentials", "--set-password"):
+        # 忘记面板密码时的救援入口(需要服务器 root 权限):
+        #   python3 vpngate_one.py --set-credentials 新账号 新密码
+        #   只改密码: python3 vpngate_one.py --set-password 新密码
+        args = sys.argv[2:]
+        new_user = args[0].strip() if len(args) >= 2 else load_auth_config().get("username", "admin")
+        new_pwd = (args[1] if len(args) >= 2 else (args[0] if args else "")).strip()
+        err = validate_username(new_user) or validate_password(new_pwd, new_user)
+        if err:
+            print(f"参数不合法: {err}")
+            sys.exit(1)
+        save_auth_config(new_user, new_pwd)
+        load_or_create_guard_token()
+        print(f"已更新管理凭据: 账号 {new_user}")
+        print(f"面板地址: {ui_tls.describe(DATA_DIR)['scheme']}://<服务器IP>:{UI_PORT}/")
+        print("请重启面板生效: systemctl restart MichaelVpn")
+        sys.exit(0)
+    main()

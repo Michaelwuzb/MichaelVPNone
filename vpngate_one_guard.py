@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# 衍生自 aimili-vpngate (https://github.com/baoweise-bot/aimili-vpngate)
+# 依据 GPL-3.0 修改与分发；本文件的衍生部分同样以 GPL-3.0 发布。
+# 完整许可见同目录 LICENSE，改造说明见 NOTICE。
+# ---------------------------------------------------------------------------
+# vpngate6 通道守护脚本（稳定版）
+# 功能:
+#   1) 定时检查 6 个通道, 发现"假连接"(面板显示 connected 但 SOCKS5 实测拿不到出口IP)自动换节点
+#   2) 可选: 定时主动轮换出口 IP (ROTATE_EVERY)
+#   3) 每个通道沿用它在面板里设置的国家 / IP 类型; 面板没设置就交给服务端自动挑
+#   4) 连续 N 轮拿不到流量才动手, 避免网络抖动误判
+# 部署: install.sh 会自动装成 vpngate6-guard.service（装完即用, 不用手动配）
+#       手动: cp vpngate_one_guard.py /opt/aimilivpn/ && systemctl restart vpngate6-guard
+# 面板地址: 面板默认已启用 HTTPS（复用机器上现成的证书, 没有就自签）,
+#       本脚本会自动在 https / http 之间探测; 回环地址不校验证书链。
+#       要写死地址就用 PANEL 环境变量, 例如 PANEL=https://127.0.0.1:8787
+
+from __future__ import annotations
+
+import json
+import os
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PANEL = os.environ.get("PANEL", "").strip()
+# 面板现在默认开 HTTPS（复用机器上的证书，没有就自签）。守护跑在同一台机器上，
+# 127.0.0.1 上自签证书的域名对不上是常态，所以不校验证书链——反正是回环地址,
+# 不存在中间人的问题。用 PANEL 环境变量显式指定地址时则不做自动探测。
+_SSL_CTX = ssl._create_unverified_context()
+PANEL_CANDIDATES = [PANEL] if PANEL else ["https://127.0.0.1:8787",
+                                          "http://127.0.0.1:8787"]
+_panel_idx = 0
+AUTH_FILE = os.environ.get("VPNGATE_UI_AUTH", "/opt/aimilivpn/vpngate_data/ui_auth.json")
+GUARD_TOKEN_FILE = os.environ.get("VPNGATE_GUARD_TOKEN_FILE", "/opt/aimilivpn/vpngate_data/guard_token")
+NUM_CHANNELS = 6            # 已废弃：通道数一律以面板 /api/status 为准（保留仅为兼容旧文档）
+PROXY_BASE_PORT = 7928     # 仅当面板是老版本、不返回 proxy_port 时的兜底推算基准
+def _env_int(name: str, default: int) -> int:
+    """读一个非负整数环境变量。空/非数字/负数一律回落到默认值 ——
+    systemd 里写错一个字符不该让守护起不来。"""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    return val if val >= 0 else default
+
+
+CHECK_EVERY = 60            # 每 60 秒检查一轮
+# 定时主动轮换出口 IP：默认 0 = 不主动换。
+# 这里改过默认值：早期版本是 30（每 30 轮≈30 分钟把全部通道换一遍），
+# 会把已经稳定用着的住宅 IP 全部打乱，也让"锁定在某县"的通道被迫重选。
+# 想恢复主动轮换：systemd 里加 Environment=VPNGATE_ROTATE_EVERY=30
+ROTATE_EVERY = _env_int("VPNGATE_ROTATE_EVERY", 0)
+FAIL_TOLERANCE = 2          # 连续 N 轮 SOCKS 测不出流量才判定假连接
+RECONNECT_COOLDOWN = 120    # 同一通道两次重连的最小间隔(秒), 防止反复抖动
+SOCKS_TEST_URL = "http://api.ipify.org"
+SOCKS_TEST_TIMEOUT = 8
+
+# 通道已掉线(state != connected)时是否也由本脚本重连。
+# 默认 False: 掉线由面板内置 watchdog(盯进程+隧道探测)负责, 本脚本只管
+# "假连接"和定时轮换 —— 两条链路各管一段, 不会同时去抢同一个 tun。
+# 如果面板 watchdog 被你关掉了, 把它改成 True。
+HANDLE_DISCONNECTED = False
+
+cookie = ""
+_warned: set[str] = set()
+
+
+def warn_once(msg: str) -> None:
+    if msg not in _warned:
+        _warned.add(msg)
+        print("[warn] " + msg, flush=True)
+
+
+def _load_guard_token() -> str:
+    """面板生成的守护长效令牌。改面板账号密码不会让它失效，守护也就不怕改密。"""
+    try:
+        with open(GUARD_TOKEN_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _load_credentials() -> tuple[str, str]:
+    """兜底: 面板还没生成令牌时，用 ui_auth.json 里的明文(仅旧版有)或环境变量登录。"""
+    env_user = os.environ.get("VPNGATE_USER", "")
+    env_pass = os.environ.get("VPNGATE_PASS", "")
+    try:
+        with open(AUTH_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+        return (env_user or cfg.get("username", "admin"),
+                env_pass or str(cfg.get("password") or ""))
+    except Exception:
+        return env_user or "admin", env_pass
+
+
+USER, PASS = _load_credentials()
+
+
+def _active_panel() -> str:
+    return PANEL_CANDIDATES[_panel_idx]
+
+
+def _switch_panel() -> bool:
+    """http/https 猜错了就换一个再试。显式指定 PANEL 时不猜。
+
+    面板加了 HTTPS 之后, 探活还用 http 会直接连不上(不是 401, 是连接层报错),
+    那样守护会把所有通道都当成"面板无响应"而彻底停摆。
+    """
+    global _panel_idx
+    if len(PANEL_CANDIDATES) < 2:
+        return False
+    _panel_idx = (_panel_idx + 1) % len(PANEL_CANDIDATES)
+    warn_once("面板地址改用 %s" % _active_panel())
+    return True
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # 登录返回 302, 不跟随, 直接从响应头取 token
+
+
+def _parse_cookie(resp) -> None:
+    global cookie
+    for h, v in resp.getheaders():
+        if h.lower() == "set-cookie":
+            for part in v.split(";"):
+                if part.strip().startswith("token="):
+                    cookie = part.strip()
+
+
+def login() -> bool:
+    """返回 True 表示拿到了会话(或至少"面板答话了")。"""
+    global cookie, USER, PASS
+    reached = True
+    tok = _load_guard_token()
+    if tok:
+        cookie = "token=" + tok
+        return True
+    # 每次都重读磁盘: 面板改账号/密码后能自动跟上, 也兼容令牌文件后生成的情况
+    USER, PASS = _load_credentials()
+    if not PASS:
+        warn_once("未找到守护令牌 %s，且 %s 里没有可用的密码；"
+                  "请确认新版面板已启动过（它会自动生成令牌），或用 VPNGATE_USER/VPNGATE_PASS 指定"
+                  % (GUARD_TOKEN_FILE, AUTH_FILE))
+        return False
+    data = urllib.parse.urlencode({"username": USER, "password": PASS}).encode()
+    req = urllib.request.Request(_active_panel() + "/api/login", data=data,
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        opener = urllib.request.build_opener(
+            NoRedirect, urllib.request.HTTPSHandler(context=_SSL_CTX))
+        _parse_cookie(opener.open(req, timeout=10))
+    except urllib.error.HTTPError as e:
+        _parse_cookie(e)
+    except Exception:
+        # 连接层失败(协议不对 / 面板没起)和"密码不对"要分开说,
+        # 否则日志会把人往改密码的方向带。
+        reached = False
+    if not cookie and reached:
+        warn_once("登录面板失败(账号或密码不对?): %s" % AUTH_FILE)
+    return reached
+
+
+def api(path, data=None, method="GET"):
+    global cookie
+    for attempt in (0, 1):
+        if not cookie and not login():
+            if attempt == 0 and _switch_panel():
+                continue
+            return None
+        headers = {"Cookie": cookie}
+        body = data
+        if body is not None:
+            body = urllib.parse.urlencode(body).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = urllib.request.Request(_active_panel() + path, data=body,
+                                     headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=20, context=_SSL_CTX) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                cookie = ""   # token 失效, 下一轮重新登录
+                warn_once("面板返回 %d: 守护令牌或账号密码无效; 若刚改过面板密码, "
+                          "请确认 %s 存在且与面板 vpngate_data/guard_token 一致"
+                          % (e.code, GUARD_TOKEN_FILE))
+            return None
+        except Exception:
+            cookie = ""
+            if attempt == 0 and _switch_panel():
+                continue
+            return None
+    return None
+
+
+def test_socks(port: int):
+    """实测 socks5 端口能不能拿到出口 IP, 返回 IP 或 None"""
+    try:
+        out = subprocess.run(
+            ["curl", "-s", "--max-time", str(SOCKS_TEST_TIMEOUT),
+             "-x", "socks5://127.0.0.1:%d" % port, SOCKS_TEST_URL],
+            capture_output=True, text=True, timeout=SOCKS_TEST_TIMEOUT + 5)
+        ip = (out.stdout or "").strip()
+        if ip and "." in ip and " " not in ip and len(ip) <= 45:
+            return ip
+    except Exception:
+        pass
+    return None
+
+
+def reconnect(idx: int, country: str, ip_type: str, node_id=None):
+    """按通道自己的设定重连。
+
+    country 非空时带 sticky=1：面板沿用该通道的县选择与降级锁（不清掉），
+    且用户没选过县时以上一个节点的县做提示 —— 同城还有可用 IP 就留原地，
+    没了才按固定顺序/由近到远就近换。
+    """
+    q = {"country": country or "", "ip_type": ip_type or ""}
+    if country:
+        q["sticky"] = "1"
+    if node_id:
+        q["node_id"] = node_id
+    return api("/api/channel/%d/connect?%s" % (idx, urllib.parse.urlencode(q)), method="POST")
+
+
+def main() -> None:
+    global cookie   # 面板无响应时要真的把会话清掉(否则下一轮 api() 不会重新登录)
+    tok_mode = bool(_load_guard_token())
+    print("vpngate6 guard start: panel=%s, every %ds, handle_disconnected=%s, auth=%s"
+          % (_active_panel(), CHECK_EVERY, HANDLE_DISCONNECTED,
+             "guard_token" if tok_mode else "account/password"), flush=True)
+    if not tok_mode:
+        warn_once("未使用守护令牌, 改用账号密码登录; 面板改密后需同步 %s, "
+                  "或升级面板让它生成 %s" % (AUTH_FILE, GUARD_TOKEN_FILE))
+
+    round_n = 0
+    fail_streak: dict[int, int] = {}
+    last_fix: dict[int, float] = {}
+
+    while True:
+        round_n += 1
+        T = time.strftime("%H:%M:%S")
+        st = api("/api/status")
+        if not st:
+            print("[%s] 面板无响应, 重新登录后重试" % T, flush=True)
+            cookie = ""
+            time.sleep(CHECK_EVERY)
+            continue
+
+        do_rotate = (ROTATE_EVERY > 0 and round_n % ROTATE_EVERY == 0)
+        if round_n == 1:
+            # 通道数从面板读，不在这里写死：改通道数时忘了同步这个常量，
+            # 守护就会按错的端口去探活，把正常通道全判成挂了。
+            print("[%s] 面板报告 %d 个通道" % (T, len(st.get("channels", []))), flush=True)
+
+        for ch in st.get("channels", []):
+            # 关键修复: 先取出 idx 再做任何判断。
+            # 原版在赋值之前就用 idx 打印日志, 遇到第一个被禁用的通道会直接
+            # NameError 让守护进程崩掉(systemd 又不断重启, 等于守护失效)。
+            idx = ch.get("index")
+            if idx is None:
+                continue
+            if not ch.get("enabled", True):
+                continue
+
+            state = ch.get("state")
+            # 端口直接取面板给的 proxy_port，不再自己按 PROXY_BASE_PORT + idx 推算。
+            # 推算的写法把"端口基准值"抄成了两份常量：面板那边一改，这里就会去连
+            # 一个没人监听的端口，把好好的通道判成"假连接"然后乱换节点。
+            port = ch.get("proxy_port")
+            if not isinstance(port, int):
+                warn_once("面板没有返回 proxy_port(旧版面板?)，回退按 %d+idx 推算" % PROXY_BASE_PORT)
+                port = PROXY_BASE_PORT + idx
+            need = False
+            reason = ""
+
+            if state == "connected":
+                ip = test_socks(port)
+                if ip:
+                    fail_streak[idx] = 0
+                    print("[%s] CH%d OK %s" % (T, idx, ip), flush=True)
+                    if do_rotate:
+                        need, reason = True, "scheduled rotate"
+                else:
+                    fail_streak[idx] = fail_streak.get(idx, 0) + 1
+                    if fail_streak[idx] >= FAIL_TOLERANCE:
+                        need = True
+                        reason = "fake-connected(%d轮无流量)" % fail_streak[idx]
+                    else:
+                        print("[%s] CH%d 探测失败 %d/%d, 继续观察"
+                              % (T, idx, fail_streak[idx], FAIL_TOLERANCE), flush=True)
+            elif HANDLE_DISCONNECTED:
+                need, reason = True, "state=%s" % state
+            else:
+                # 掉线交给面板 watchdog, 本脚本不插手(避免抢 tun)
+                continue
+
+            if not need:
+                continue
+            if time.time() - last_fix.get(idx, 0) < RECONNECT_COOLDOWN:
+                print("[%s] CH%d 冷却中, 跳过 (%s)" % (T, idx, reason), flush=True)
+                continue
+
+            last_fix[idx] = time.time()
+            fail_streak[idx] = 0
+            country = ch.get("force_country") or ""
+            ip_type = ch.get("force_ip_type") or ""
+            print("[%s] CH%d FIX (%s) -> %s / %s"
+                  % (T, idx, reason, country or "自动", ip_type or "全部IP"), flush=True)
+            res = reconnect(idx, country, ip_type)
+            if res is None or not res.get("ok"):
+                print("[%s] CH%d 重连未成功: %s" % (T, idx, res), flush=True)
+            time.sleep(3)
+
+        time.sleep(CHECK_EVERY)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:
+        print("[fatal] guard 异常退出: %s" % e, flush=True)
+        raise
