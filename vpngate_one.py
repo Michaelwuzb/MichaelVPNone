@@ -437,10 +437,10 @@ def write_json(path: Path, data: Any):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # === 代理口认证 ===
-# 单通道版把代理口绑在 0.0.0.0（NAT 映射需要，见 PROXY_LISTEN_HOST 的注释），
-# 所以默认必须是"带认证"的，否则就是个谁都能用的开放代理。
-# 凭据只存一份（vpngate_data/proxy_auth.json，chmod 600）：install.sh 生成它，
-# proxy_server 和面板都从这里读，避免 systemd Environment 与文件两处各写一份对不上。
+# 单通道版把代理口绑在 0.0.0.0（NAT 映射需要，见 PROXY_LISTEN_HOST 的注释）。
+# 默认**无认证**，和 6/9 通道版一致，本机/内网直接连。
+# 只有当把 7928 映射到公网时，才建议手动生成一份凭据（vpngate_data/proxy_auth.json，
+# chmod 600）：proxy_server 和面板都从这里读，避免 systemd Environment 与文件两处各写一份对不上。
 # 想自己指定就用环境变量 LOCAL_PROXY_USER / LOCAL_PROXY_PASS，优先级更高。
 PROXY_AUTH_FILE = DATA_DIR / "proxy_auth.json"
 
@@ -475,7 +475,7 @@ def proxy_info() -> tuple[str, str]:
     if u:
         full += f"  账号 {u}  密码 {p}"
     else:
-        full += "  （未设账号密码：任何能连上这个端口的人都能用，建议装上 install.sh 生成的凭据）"
+        full += "  （无认证：本机/内网直接连；映射公网前建议在 vpngate_data/proxy_auth.json 补一份凭据）"
     return short, full
 
 

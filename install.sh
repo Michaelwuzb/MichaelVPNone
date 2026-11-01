@@ -185,25 +185,23 @@ open(p, "w", encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False, indent=
 print("  ui_auth.json 明文密码已升级为哈希")
 PYEOF
 
-    # 代理口认证：单通道版把 7928 绑在 0.0.0.0（NAT 映射要求），
-    # 没有账号密码就等于对外开放一个无认证代理，所以默认生成一组。
-    # 已存在就保留，不会每次重装都换密码（换了客户端得跟着改）。
-    if [ ! -f "$INSTALL_DIR/vpngate_data/proxy_auth.json" ]; then
-        python3 - "$INSTALL_DIR" << 'PYEOF' 2>/dev/null || true
-import json, os, secrets, sys
-p = os.path.join(sys.argv[1], "vpngate_data", "proxy_auth.json")
-cfg = {"username": "mvp" + secrets.token_hex(2),
-       "password": secrets.token_urlsafe(12)}
-open(p, "w", encoding="utf-8").write(json.dumps(cfg, ensure_ascii=False, indent=2))
-os.chmod(p, 0o600)
-PYEOF
-    fi
+    # 代理口认证：默认**不开启**，和 6/9 通道版保持一致 —— 7928 无账号密码，本机 / 内网直接连。
+    # 只有当你要把 7928 映射到公网（NAT 出站）时，才建议手动补一份认证，防止被白嫖：
+    #   python3 - <<'PYEOF'
+    #   import json, secrets
+    #   p = "/opt/aimilivpn/vpngate_data/proxy_auth.json"
+    #   json.dump({"username": "mvp" + secrets.token_hex(2),
+    #              "password": secrets.token_urlsafe(12)},
+    #             open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    #   import os; os.chmod(p, 0o600)
+    #   PYEOF
+    #   然后 systemctl restart MichaelVpn。
+    # 如果之前装过带认证的版本、现在想回到无认证，删掉 proxy_auth.json 再重启即可。
 
     chmod -R 755 "$INSTALL_DIR"
-    # 面板凭据、守护令牌、代理凭据都不能全机可读
+    # 面板凭据、守护令牌都不能全机可读
     chmod 600 "$INSTALL_DIR/vpngate_data/ui_auth.json" 2>/dev/null || true
     chmod 600 "$INSTALL_DIR/vpngate_data/guard_token" 2>/dev/null || true
-    chmod 600 "$INSTALL_DIR/vpngate_data/proxy_auth.json" 2>/dev/null || true
     echo -e "${GREEN}  OK${NC}"
 }
 
@@ -304,18 +302,11 @@ info() {
     echo "  代理端口: 7928  (SOCKS5 + HTTP 共用，绑 0.0.0.0)"
     echo "  测速端口: 7929  (只看回环，不需要映射)"
     echo "  面板端口: 8787"
-    python3 - <<'PY' 2>/dev/null || echo "  (读不到 proxy_auth.json，可能还没装好)"
-import json
-try:
-    a = json.load(open("/opt/aimilivpn/vpngate_data/proxy_auth.json", encoding="utf-8"))
-except Exception:
-    a = {}
-if a.get("username"):
-    print("  代理账号: %s" % a["username"])
-    print("  代理密码: %s" % a["password"])
-else:
-    print("  代理认证: 未设置（任何能连上 7928 的人都能用，建议补一份 proxy_auth.json）")
-PY
+    echo "  代理认证: 默认无认证（和 6/9 通道版一样，127.0.0.1:7928 直接连）"
+    if [ -f "$INSTALL_DIR/vpngate_data/proxy_auth.json" ]; then
+        echo "  提示: 检测到旧的 proxy_auth.json，代理口当前仍带认证。"
+        echo "        想回到无认证就删掉它再重启：rm -f $INSTALL_DIR/vpngate_data/proxy_auth.json"
+    fi
 }
 case "${1:-status}" in
     start)   systemctl start MichaelVpn vpngate-one-guard 2>/dev/null ;;
@@ -479,15 +470,9 @@ else
 fi
 echo -e "  卸载:      ${CYAN}ml uninstall${NC}"
 echo ""
-python3 - <<'PY' 2>/dev/null || true
-import json
-try:
-    a = json.load(open("/opt/aimilivpn/vpngate_data/proxy_auth.json", encoding="utf-8"))
-    print("  ┌─ 代理连接信息（客户端里填这组）──────────────")
-    print("  │ 端口: 7928  (SOCKS5 / HTTP)")
-    print("  │ 账号: %s" % a.get("username", ""))
-    print("  │ 密码: %s" % a.get("password", ""))
-    print("  └─────────────────────────────────────────────")
-except Exception:
-    pass
-PY
+echo -e "  ${GREEN}代理连接（客户端里填这组，无认证）${NC}"
+echo -e "  ┌─────────────────────────────────────────────"
+echo -e "  │ 地址: 127.0.0.1  (本机/内网) 或 你的公网映射"
+echo -e "  │ 端口: 7928  (SOCKS5 / HTTP)"
+echo -e "  │ 认证: 无（和 6/9 通道版一致）"
+echo -e "  └─────────────────────────────────────────────"
